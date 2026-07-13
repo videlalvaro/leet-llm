@@ -1,0 +1,164 @@
+{
+  "029": {
+    "strategy": "Quantize a Float32 tensor to INT8 using symmetric range [-127, 127] by finding the maximum absolute value, deriving scale as max/127 (or 1.0 for all-zero tensors to avoid NaN), applying deterministic rounding using nearest-with-ties-away-from-zero, clamping to range, then dequantizing by multiplying reconstructed integers by the scale. The implementation in WeightQuantizationSolutionSupport.quantizeInt8 validates finite input, computes maximum absolute value, applies the rounding rule from QuantizationRounding.nearestAwayFromZero, and produces a SymmetricInt8Tensor storing values and scale separately.",
+    "invariant": "For all-zero input, scale equals 1.0 and all quantized values are zero. For nonzero input, the maximum absolute value maps exactly to ±127. Reconstruction error is bounded by scale/2 for any value, and RMSE is computed over the full tensor using Double precision to avoid accumulation rounding.",
+    "pitfall": "Excluding -128 from the range appears arbitrary but is essential: it preserves symmetric magnitude around zero so both positive and negative extrema map to the same denominator. Using nearest-to-even or truncation instead of away-from-zero introduces systematic bias. Omitting the all-zero case causes division by zero or NaN scales.",
+    "points": [
+      {
+        "title": "Symmetric range excludes -128 by design",
+        "body": "The range [-127, 127] has 255 representable values with equal magnitude above and below zero. Using -128 would create asymmetry: no +128 counterpart. This matters because scale = max / 127 scales the entire range uniformly."
+      },
+      {
+        "title": "Finite checks precede quantization",
+        "body": "WeightQuantizationSolutionSupport.validateFinite iterates the input array and rejects any NaN or infinity before computing the maximum. This prevents silent propagation of invalid inputs into scale derivation."
+      },
+      {
+        "title": "Ties always move away from zero",
+        "body": "The rounding rule nearestAwayFromZero rounds x.5 toward ±∞, so 63.5 → 64 and -63.5 → -64. This deterministic tie-breaking is baked into QuantizationRounding and must match both the converter and any downstream decoder."
+      },
+      {
+        "title": "Metrics use Double accumulation",
+        "body": "Maximum absolute error is tracked as Double during comparison, then stored as Float. RMSE sums squared differences in Double before taking sqrt and converting to Float. This avoids single-precision rounding bias in error measurement."
+      },
+      {
+        "title": "All-zero tensors return scale 1.0",
+        "body": "When maximum is zero, scale is explicitly set to 1 rather than 0/127. Every quantized value remains zero, and dequantization 0 * 1 = 0 is exact. This special case avoids division by zero and allows correct reconstruction of sparse or zero-initialized tensors."
+      }
+    ]
+  },
+  "030": {
+    "strategy": "Extend Problem 029's per-tensor INT8 quantization to per-group quantization by partitioning each row of [out, in] weights into contiguous segments of size groupSize columns, deriving one scale per group from that group's maximum absolute value, and quantizing within each group independently. The scale metadata is logically shaped [out, ceil(in/groupSize)] and indexed by scaleIndex(row, column) = row * groupsPerOutputChannel + column / groupSize. Tail groups (when in is not divisible by groupSize) are shorter but still own a scale. The implementation iterates output channels and groups, computes maximum in each group window, applies the ±127 scale formula, quantizes within the window, and stores scales in row-major flat order.",
+    "invariant": "Each weight value belongs to exactly one group. The scale for group (o, g) is derived only from values in [o*in + g*G, o*in + min((g+1)*G, in)). All-zero groups have scale 1.0. The tail group for each row may be shorter than groupSize but is never omitted.",
+    "pitfall": "Using floor(in / groupSize) instead of ceiling for group count causes the final partial group to be lost. Incorrect scale indexing (e.g., column % groupSize instead of column / groupSize) misaligns quantized values and scales. Not handling the all-zero group case causes zero scale in metadata.",
+    "points": [
+      {
+        "title": "Group count uses ceiling division",
+        "body": "groupsPerOutputChannel = (inputChannels + groupSize - 1) / groupSize. For in=5, G=3, this gives (5+2)/3 = 2 groups. Using integer division alone would yield 1 group, dropping the tail."
+      },
+      {
+        "title": "Scale indexing binds group to quantized window",
+        "body": "scaleIndex(row, col) = row * groupsPerOutputChannel + col / groupSize. Column 4 in a 3-wide group belongs to group 4/3=1, not group 4%3=1. This formula ensures each quantized value reads its group's scale."
+      },
+      {
+        "title": "Groupwise scales lower reconstruction error",
+        "body": "Per-tensor scale is forced to accommodate the global maximum. Groupwise scales adapt to local ranges: a small group of values uses its own denominator, not the tensor-wide maximum. The fixture with O=2, I=5, G=3 shows error reduction when row 1's small values use scale 0.1/127 instead of 10/127."
+      },
+      {
+        "title": "Metadata overhead grows with groups",
+        "body": "Scales occupy 4*out*K bytes where K=ceil(in/G). Smaller groups yield more scales; problem 006's roofline model quantifies whether error reduction justifies higher metadata traffic."
+      },
+      {
+        "title": "Tail groups are valid and necessary",
+        "body": "When in=5 and G=3, the tail group spans columns 3-4 (2 values). It owns one scale derived from those 2 values only. Omitting it or reusing a neighboring scale breaks the quantization invariant."
+      }
+    ]
+  },
+  "031": {
+    "strategy": "Pack signed Q4 integers (range [-8, 7]) into UInt8 bytes, two values per byte, using low-nibble-first format. For logical value index i, the byte is computed as: byte[i/2] = (nibble_i & 0x0f) | ((nibble_{i+1} & 0x0f) << 4) for even i. Unpacking reverses this: even indices read low nibble from byte & 0x0f, odd indices read high nibble from byte >> 4, then sign-extend: if nibble >= 8, value = nibble - 16. The format requires zero padding in the unused high nibble when the logical count is odd. Implementation in packQ4 iterates logical values, validates range [-8, 7], packs by masking into nibbles, and validates zero padding in GroupwiseQ4WeightMatrix initialization.",
+    "invariant": "Even logical indices occupy bits 0-3 of their byte; odd indices occupy bits 4-7. Sign extension rule is constant: nibble n maps to n if n<8, else n-16. For odd-length streams, the high nibble of the last byte is zero and must be validated to reject non-canonical encodings.",
+    "pitfall": "Swapping nibble order (high-first instead of low-first) produces byte = nibble_i << 4 | nibble_{i+1}, making all existing packed data undecodable. Not zero-padding odd-length streams allows multiple byte sequences to decode to the same logical values, violating uniqueness. Forgetting sign extension (treating all nibbles as unsigned) produces incorrect negative values.",
+    "points": [
+      {
+        "title": "Two's-complement nibble encoding spans -8 to 7",
+        "body": "Four bits represent decimal -8..7. Pattern 0x8=1000 is -8, 0xf=1111 is -1, 0x0=0000 is 0, 0x7=0111 is 7. Sign extension checks nibble >= 8 and subtracts 16 if true."
+      },
+      {
+        "title": "Low nibble first packs logically contiguous values",
+        "body": "Logical pairs (i, i+1) pack into one byte as (low_nibble, high_nibble). Walking columns sequentially across rows produces one continuous logical stream. Odd I values create mid-byte boundaries when transitioning rows."
+      },
+      {
+        "title": "Padding nibble must be zero",
+        "body": "When logicalCount is odd, the last byte's high nibble is unused padding. GroupwiseQ4WeightMatrix validation rejects nonzeroPaddingNibble to ensure only one byte encoding represents each logical matrix."
+      },
+      {
+        "title": "Format code identifies the decoding rule",
+        "body": "Q4WeightFormat = signedTwosComplementLowNibbleFirst (raw value 0) is the only accepted format. Both CPU and Metal kernels check this enum to confirm they decode nibbles and sign-extend identically."
+      },
+      {
+        "title": "Unpacking uses bit shifts, not lookups",
+        "body": "Extracting nibble n from byte b uses: n_low = b & 0x0f, n_high = b >> 4. Sign extension is: n >= 8 ? n - 16 : n. This bit-level operation runs identically in CPU and Metal without lookup tables."
+      }
+    ]
+  },
+  "032": {
+    "strategy": "Validate input rank and inner width, allocate O*I Float32 elements for materialized weights, iterate logical (row, column) pairs, unpack each Q4 value through GroupwiseQ4WeightMatrix.quantizedValue (which reads the packed byte, extracts the correct nibble, and sign-extends), load the group scale via scaleIndex, multiply quantized * scale, store into the float array, then call the existing P004 GEMV on the materialized tensor. Return the output, materialized weights, and temporaryWeightBytes = 4*O*I (exact byte count). This staged path does not fuse; every weight is reconstructed to Float before accumulation. The CPU oracle in problem 033 bypasses this step to verify fused output against the staged baseline.",
+    "invariant": "Materialized weights follow W_rc = Float(q_rc) * s_{r, floor(c/G)}. Each output row is the Float32 sum of I products W_rc * x_c; all O rows together consume O*I logical weights. The canonical fused CPU path uses the same left-to-right product and column accumulation order, allowing direct comparison with this staged baseline without claiming that floating-point multiplication is associative.",
+    "pitfall": "Mixing logical column index with packed byte index during unpacking. Not validating input rank or inner width, allowing out-of-bounds reads in GEMV. Forgetting to multiply by the group scale, leaving quantized values as integers. Not accounting for the 4*O*I temporary bytes in reporting.",
+    "points": [
+      {
+        "title": "Rank and width validation precedes indexing",
+        "body": "Input rank must be 1. Input width must equal weights.inputChannels. These checks run before any array access, preventing rank mismatches and dimension errors from propagating into GEMV."
+      },
+      {
+        "title": "Materialization materializes all logical values",
+        "body": "The loop walks (row=0..O-1, column=0..I-1), unpacks via quantizedValue, dequantizes by scale, and stores into a flat Float32 [O*I] array. The temporary exists for the lifetime of the GEMV call only; it is not cached."
+      },
+      {
+        "title": "quantizedValue handles packing transparently",
+        "body": "Calling weights.quantizedValue(row, col) abstracts the byte lookup and sign extension. The caller does not manipulate packed bytes; it reads signed Q4 integers directly."
+      },
+      {
+        "title": "Temporary allocation is explicit",
+        "body": "DequantizeThenGEMVResult reports temporaryWeightBytes = weights.logicalValueCount * 4. For a 64x1024 matrix, this is 262,144 bytes, or 256 KiB, of Float32 storage. Materialization writes that temporary and the following GEMV reads it; the reported field is an allocation count rather than a hardware traffic measurement."
+      },
+      {
+        "title": "Staged output baseline catches format errors early",
+        "body": "If the packed bytes or scale indexing is wrong, the materialized weights will obviously be incorrect. Running the plain GEMV on that tensor isolates format errors from fused-kernel errors, making debugging deterministic."
+      }
+    ]
+  },
+  "033": {
+    "strategy": "Fuse Q4 unpacking, scale loading, and GEMV accumulation into one operator. The CPU reference iterates output rows and columns, loads one Q4 nibble via quantizedValue, multiplies by the group scale (scaleIndex maps column to the correct scale), multiplies by input[column], and accumulates all products into one output value. The Metal kernel assigns one output row to each threadgroup, distributes columns across lanes using lane-strided loop (column = lane, lane+256, ...), extracts nibbles directly from packed bytes using bit operations, dequantizes in registers, and reduces using a 256-element threadgroup barrier. The format code (signedTwosComplementLowNibbleFirst = 0) is validated and passed to MSL. Both return temporaryWeightBytes = 0 because no Float [O, I] temporary is allocated.",
+    "invariant": "Output y_r = sum_{c=0}^{I-1} quantizedValue(r, c) * scale[scaleIndex(r, c)] * input[c]. The accumulation is Float32 in both paths. No intermediate weight tensor is stored or read from memory. Each quantized weight is fetched and dequantized exactly once per GEMV call.",
+    "pitfall": "Allocating a temporary Float weight matrix and claiming zero temporary bytes. Using the wrong nibble (swapping low/high). Missing the threadgroup barrier in the Metal reduction, causing races on the scratch array. Forgetting to sign-extend nibbles >= 8. Validating format as an integer instead of checking the enum value.",
+    "points": [
+      {
+        "title": "Lane-strided loop distributes work across 256 threads",
+        "body": "Lane t processes columns t, t+256, t+512, ... This spreads I columns evenly across lanes. Each lane accumulates its columns independently, then the threadgroup reduction combines partial sums."
+      },
+      {
+        "title": "Quantized values are decoded in the register that consumes them",
+        "body": "The Metal kernel does not allocate storage for q_rc. It reads the packed byte, extracts the nibble, sign-extends, multiplies by scale and input, and accumulates the product—all in one lane's local registers."
+      },
+      {
+        "title": "Threadgroup barrier synchronizes before reduction starts",
+        "body": "Each lane writes its partial sum into threadgroup scratch at index [lane]. The barrier ensures all writes are visible before any lane reads scratch[lane + stride]. Without the barrier, reads of partially-written data race and produce wrong sums."
+      },
+      {
+        "title": "Sign extension uses bitwise OR for speed",
+        "body": "Metal: if (nibble >= 8) quantized = int(nibble) - 16; CPU: Int8(bitPattern: nibble >= 8 ? nibble | 0xf0 : nibble). The bitwise form sets the sign bit without arithmetic."
+      },
+      {
+        "title": "Zero temporary weight bytes is the goal of fusion",
+        "body": "FusedQ4GEMVResult.temporaryWeightBytes = 0 records that no [O, I] Float matrix was allocated. logicalWeightBytes counts the persistent packed values and scales: ceil(O*I/2) + 4*O*ceil(I/G). It does not claim that these are the only runtime bytes moved; the operator also reads the input and scales, writes output, and the Metal reduction uses threadgroup scratch."
+      }
+    ]
+  },
+  "034": {
+    "strategy": "Run four independent execution streams through the same pipeline: (1) Float32 weights, (2) Groupwise INT8 weights with requested groupSize, (3) Groupwise Q4 weights with requested groupSize, (4) The same Q4 bytes and scales but decoded with reversed nibble order. Each stream starts with the initial Float state, quantizes the Float weights once (not reset), applies a GEMV (float, int8, Q4-canonical, or Q4-reversed), applies tanh activation, and captures the output. For each layer, compute metrics between the Float output and each candidate: cosine similarity, maximum absolute error, RMSE (all using Double during reduction), and argmax agreement (check if argmax indices match). Record the first layer where INT8, Q4, or reversed-Q4 streams show argmax disagreement. For the mismatch stream, count how many logical Q4 values differ under low-nibble-first versus high-nibble-first decoding. This deterministic investigation isolates convention bugs from inherent quantization noise.",
+    "invariant": "Streams do not reset to Float state between layers, so earlier approximation errors propagate to later layers. Cosine similarity is computed as (a·b) / (||a|| ||b||) using Double. Argmax agreement is true iff both vectors select the same maximum index. The reversed-nibble stream proves whether a nibble-order error exists by counting changed values under the deliberate fault.",
+    "pitfall": "Resetting quantized states to Float after each layer breaks error accumulation and makes layers appear independent. Using only cosine similarity without argmax agreement misses cases where vectors are directionally similar but the peak value shifts. Not injecting a controlled format fault leaves the diagnosis inconclusive if reversal count is zero. Blaming quantization noise when the first divergence is at layer 0 (likely a scale or convention mismatch, not noise).",
+    "points": [
+      {
+        "title": "Layer capture preserves intermediate state without reset",
+        "body": "Each layer's output becomes the input to the next layer. States are not reset to Float, so accumulated errors from layer 0 propagate forward. This reveals whether errors diverge at layer 1 or accumulate silently until a later layer flips argmax."
+      },
+      {
+        "title": "Metrics must include both direction and magnitude",
+        "body": "Cosine similarity ∈ [0, 1] measures directional agreement. Maximum error and RMSE measure magnitude. Argmax agreement is a discrete binary: two vectors with cos(a,b) = 0.95 may still have different argmax indices if peaks are near-ties."
+      },
+      {
+        "title": "Double precision accumulation avoids metric bias",
+        "body": "Cosine similarity and RMSE are computed in Double to avoid single-precision rounding bias in the metric itself. A difference between streams may be sub-Float-epsilon but still meaningful; Double accumulation makes it visible."
+      },
+      {
+        "title": "Controlled nibble-order fault isolates convention mismatches",
+        "body": "reversedNibbleValue decodes the same packed bytes with high-nibble-first (the opposite of the canonical format). If changedDecodedValueCount > 0, then many Q4 values change meaning under this reversal. If streams agree despite the reversal, the divergence is not nibble order."
+      },
+      {
+        "title": "First divergence layer narrows the search space",
+        "body": "If INT8 and Float agree through layer 2 but diverge at layer 3, the error originated in layer 3's weights or computation, not earlier. Similarly, if Q4 follows Float exactly until layer 5, quantization is behaving correctly through layer 4."
+      }
+    ]
+  }
+}

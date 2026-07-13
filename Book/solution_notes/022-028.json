@@ -1,0 +1,163 @@
+{
+  "022": {
+    "strategy": "Allocate fixed-size contiguous storage for K and V tensors with shape [L,C,Hkv,dh] where C is the maximum token capacity. Appends write each new K/V token to sequential physical slots while tracking absolute logical positions independently per layer. Layer-level count and position metadata enforce sequential position requirements (position N must be followed by N+1), and storage base addresses remain stable across all operations—no dynamic reallocation.",
+    "invariant": "Physical slots within each layer fill contiguously from zero without gaps. Each layer maintains its own logical position sequence, and appends must respect strict monotonicity: if the last position was N, the next append must be N+1. Capacity never overflows. Base addresses of keyStorage and valueStorage remain constant throughout the cache lifetime.",
+    "pitfall": "Confusing logical position with physical slot index. Position 10 appended first goes to slot 0, not slot 10. Later position gaps (e.g., appending 12 after 10) violate the sequential contract and throw positionSequenceMismatch, preventing non-contiguous histories that would break RoPE and causal attention semantics.",
+    "points": [
+      {
+        "title": "Token-major offset formula",
+        "body": "Element offset = (((layer*C + slot)*Hkv + head)*dh + feature). This packing ensures all features of one head are contiguous, all heads of one token are contiguous, and all tokens in one layer are contiguous, enabling efficient sequential appends."
+      },
+      {
+        "title": "Layer isolation via per-layer metadata",
+        "body": "Each layer has independent counts[layer] and firstPositions[layer]. Appending to layer 0 increments only counts[0] and updates only firstPositions[0], leaving layer 1's state untouched. This isolation is essential for multi-layer inference where each layer progresses independently."
+      },
+      {
+        "title": "First position can be any nonnegative integer",
+        "body": "Unlike slot indices (which start at 0), logical positions are absolute model positions. firstPositions[layer] records where the sequence started (e.g., position 7). Subsequent positions must increment by exactly 1, enabling position-relative RoPE calculations."
+      },
+      {
+        "title": "Storage stability verification",
+        "body": "storageAddresses() returns the base pointers before and after append sequences. The test verifies before == after, proving no Array.append() calls on keyStorage or valueStorage—all writes use fixed offset arithmetic within pre-allocated arrays."
+      }
+    ]
+  },
+  "023": {
+    "strategy": "Append K/V for the current token to the contiguous cache, then compute attention over all cached positions using online softmax. The query (at the appended token's absolute position) is evaluated against cached K/V reused bit-for-bit from prior appends. Causal masking uses absolute logical positions, not slot indices, to correctly mask future tokens and ensure positions that are not yet appended remain invisible.",
+    "invariant": "Query position must equal firstLogicalPosition + tokenCount - 1 (the appended token's own position). All cached K/V vectors are reused exactly as written; no recomputation. Online softmax accumulates numerator and denominator across visible positions in chronological order. Query head h_q maps to KV head floor(h_q / groupSize) deterministically.",
+    "pitfall": "Using local token index or slot index for causal masking instead of absolute position. Cached positions [11,12,13] masked on local index would incorrectly block positions 11 and 12 from a query at local slot 2. Causal correctness requires logicalPosition <= queryLogicalPosition, enforced via absolute positions from logicalPositions().",
+    "points": [
+      {
+        "title": "Append-then-attend ordering",
+        "body": "K/V for the current token are appended first, making them available for that token's own attention (self-attention). Attention then reads chronologically from the cache, applying causal masking based on absolute positions, not physical slot order."
+      },
+      {
+        "title": "Online softmax with three-state tracking",
+        "body": "Online softmax maintains (maximum, denominator, weighted_accumulator) across the position loop. maximum tracks the largest score seen so far to avoid overflow in exp() calculations. After all visible positions, the accumulator is divided by denominator to produce the final normalized output without materializing the full attention matrix."
+      },
+      {
+        "title": "Head-to-head mapping via groupSize",
+        "body": "kvHead = floor(queryHead / groupSize) where groupSize = queryHeadCount / keyValueHeadCount. For GQA with Hq=4, Hkv=2, this yields [0,0,1,1], correctly mapping contiguous groups. The same KVCacheReadable protocol abstracts Float and quantized caches, with dequantization transparent to attention logic."
+      },
+      {
+        "title": "Immutable configuration validation",
+        "body": "KVCacheConfiguration is validated at cache construction. Append and read operations reuse the immutable configuration, avoiding repeated validation and enabling Metal kernels to assume fixed layer count, head count, and feature dimension without dynamic branching."
+      }
+    ]
+  },
+  "024": {
+    "strategy": "Copy logical [L,T,Hkv,dh] tensor into both token-major [L,T,Hkv,dh] and head-major [L,Hkv,T,dh] physical memory layouts. Verify both layouts round-trip (copy back recovers the original logical values). Generate access traces for a selected (layer, head) by looping token-then-feature, counting contiguous memory spans. Both layouts store the same logical values; layout choice depends on workload, not universal superiority.",
+    "invariant": "Round-trip logical values must survive copy-to-physical and inverse-gather-to-logical for both layouts. Token-major and head-major offset formulas must produce correct physical addresses for every (layer, slot, head, feature) tuple. Trace offsets must match the computed offset formula exactly; out-of-order memory access or incorrect formula produces wrong trace span counts.",
+    "pitfall": "Assuming one layout universally outperforms the other without measuring on the actual machine and workload. Token-major excels for append (one token is contiguous) but reads one head across T tokens as T disjoint spans. Head-major reverses this: append scatters, one head read is contiguous. Cache locality, SIMD behavior, and prefetch effectiveness vary by processor; benchmark boundary (loop, allocation, build, shape, machine) determines winner.",
+    "points": [
+      {
+        "title": "Token-major vs. head-major offset formulas",
+        "body": "Token-major: (((l*T + h)*H + h)*D + d) groups features, then heads, then tokens. Head-major: (((l*H + h)*T + t)*D + d) groups features, then tokens, then heads. For (l=1, t=2, h=1, d=2) with L=2,T=4,H=2,D=3: token-major yields offset 41, head-major yields 44."
+      },
+      {
+        "title": "Access span counting for cache behavior",
+        "body": "Reading one head across four tokens in token-major yields four 12-byte spans (one per token) due to strided head access. Head-major yields one 48-byte span (all tokens contiguous for that head). Span count quantifies memory fragmentation; fewer spans indicate better cache locality for that access pattern."
+      },
+      {
+        "title": "Round-trip proves invertibility",
+        "body": "Copy to physical, then copy back to logical must recover original values exactly. Test uses sequential values (0, 1, 2, ...) so any wrong permutation creates visible errors. Both layouts must pass round-trip; a fake implementation that labels one layout but stores the other fails immediately."
+      },
+      {
+        "title": "Benchmark measurements are machine and workload specific",
+        "body": "Access trace is deterministic (same offsets every run), but nanoseconds are not. Benchmark loops over iterations, reads in layer-head-token-feature order (the critical memory access pattern), and records median time plus checksum to prevent dead-code elimination. Results are local to this machine, this build, this shape—not universal."
+      }
+    ]
+  },
+  "025": {
+    "strategy": "Allocate cache with Hkv heads (not Hq). Map each query head to its KV head using floor division: kvHead = floor(queryHead / groupSize) where groupSize = Hq / Hkv. Compute attention separately for each query head, reusing the same K/V vector for groupSize consecutive query heads. Byte comparison shows MHA uses 4x the cache of MQA and demonstrates GQA as a memory-efficient middle ground.",
+    "invariant": "Hq must be exactly divisible by Hkv to form equal-sized groups. Each group of groupSize consecutive query heads reads the same cached KV vector, preserving learned shared state. Attention output has Hq channels (one per query head) even though K/V storage has only Hkv channels. No silent aliases from incorrect head mapping.",
+    "pitfall": "Using qHead % Hkv (modulo) instead of qHead / groupSize (floor division) for head mapping. For Hq=4, Hkv=2, modulo produces [0,1,0,1] instead of the required [0,0,1,1], causing heads 0 and 2 to share one KV vector and heads 1 and 3 to share another—inverting the contiguous-group architecture and breaking the learned model behavior.",
+    "points": [
+      {
+        "title": "Group size and byte scaling",
+        "body": "groupSize = Hq / Hkv. MHA (Hq=Hkv) has groupSize=1 and stores 1 KV per query head. MQA (Hkv=1) has groupSize=Hq and stores 1 KV shared by all query heads. GQA intermediate (e.g., Hq=8, Hkv=2) has groupSize=4: four query heads per KV head, reducing cache by 4x vs. MHA while retaining per-head computation."
+      },
+      {
+        "title": "Exact byte comparison: MHA, MQA, GQA",
+        "body": "For L=2, T=3, dh=2: MHA (Hkv=4) uses 384 bytes, MQA (Hkv=1) uses 96 bytes, GQA (Hkv=2) uses 192 bytes. Byte formula: 2*L*T*Hkv*dh*4. GQA is a tunable point between memory-hungry MHA and compute-inefficient MQA."
+      },
+      {
+        "title": "Online softmax state per query head, not shared",
+        "body": "Even if two query heads read the same KV vector, each head accumulates its own (maximum, denominator, value_accumulator) independently. Reuse is only K/V storage; compute state remains separate, avoiding spurious correlations between output channels."
+      },
+      {
+        "title": "Configuration validation at construction",
+        "body": "KVHeadMemoryModel.compare() and AttentionConfiguration constructors validate Hq % Hkv == 0 before computing bytes or offsets. Invalid divisibility throws queryHeadsNotDivisible, preventing silent misalignment. All downstream code assumes valid grouping."
+      }
+    ]
+  },
+  "026": {
+    "strategy": "Reserve fixed C slots per layer with a nextSlot cursor starting at 0. On append, write K/V and logical position to nextSlot, then nextSlot = (nextSlot + 1) % C. Once count reaches C, the cache is full; further appends overwrite the oldest slot (at nextSlot). Chronological view reconstructs logical order via (nextSlot + index) % C without exposing wraparound to attention. Sliding-window attention filters to window bounds and applies causal masking on absolute positions.",
+    "invariant": "Logical positions are monotonically increasing (position N followed by N+1). Physical slots wrap via modulo, hiding wraparound from external code. Overwritten positions become permanently inaccessible—reads reject logicalPosition if the token was evicted. Count caps at C. Window size must be positive.",
+    "pitfall": "Reading chronological positions via simple slot order [0, 1, 2] instead of [(oldestSlot + i) % C]. For a full cache at slot 2 holding positions [15, 16, 17] (oldest at slot 2), reading slots in order yields [16, 17, 15] instead of [15, 16, 17]. Attention then uses wrong absolute positions for RoPE and causal masking, breaking output correctness.",
+    "points": [
+      {
+        "title": "Wraparound and chronological enumeration",
+        "body": "After appending positions 10..17 into capacity 3, the final state is positions[layer*C + slot] = [16, 17, 15] at slots [0, 1, 2] with nextSlot=2. Enumeration uses chronologicalSlot = (nextSlot + index) % C for index in [0, count), yielding slots [2, 0, 1] → positions [15, 16, 17]."
+      },
+      {
+        "title": "Position metadata storage and lookup",
+        "body": "Position array has fixed capacity C, indexed by [layer*C + slot]. logicalPositions(layer) rebuilds chronological order by walking (nextSlot + i) % C and reading positions[layer*C + slot], avoiding repeated binary search and making enumeration O(count) linear."
+      },
+      {
+        "title": "Sliding-window filtering via KVCacheReadable",
+        "body": "Ring cache implements KVCacheReadable, returning chronological positions. Windowed attention receives logicalPositions(), filters to window bounds, applies causal policy. Attention code never sees physical slot order or wraparound; the cache abstraction hides implementation."
+      },
+      {
+        "title": "Overwrite and inaccessibility",
+        "body": "Once full, every append increments nextSlot and overwrites the oldest token. Overwritten positions are no longer in the position metadata table. Reads that request an evicted position throw positionNotCached, preventing stale K/V reads and forcing window size enforcement at the application layer."
+      }
+    ]
+  },
+  "027": {
+    "strategy": "Partition logical token sequence into pages of size P. Allocate physical pages on-demand from a shared pool. Page table maps logical page ordinal (floor(logicalSlot / P)) to physical page ID. Multiple layers share the allocator; freeing one layer returns its pages to the pool for reuse. Paged reads translate logicalPosition → logicalSlot → pageOrdinal / slotInPage → physical page ID → physical offset, gathering across non-contiguous pages transparently to attention.",
+    "invariant": "logicalSlot = logicalPosition - firstPosition. Logical slots fill contiguously starting from 0. Each new logical page (when logicalSlot % P == 0) allocates one physical page; allocation fails if no free page exists. Free resets a layer's page table and counts without deallocating the table array itself, preserving capacity for reuse. Physical pages never move; page table is the only address mapping.",
+    "pitfall": "Assuming logical pages are contiguous in physical memory. Logical pages [0, 1, 2] of one layer might use physical pages [5, 12, 3] if the allocator reuses freed pages. Reading logical token at position 11 (in logical page 1, slot 1) must look up pageTable[layer][1] to find physical page 12, then compute physical offset—direct table lookup is mandatory, not optional.",
+    "points": [
+      {
+        "title": "Paged addressing formula",
+        "body": "logicalSlot = p - p0, pageOrdinal = logicalSlot / P, slotInPage = logicalSlot % P. physicalPage = pageTable[layer][pageOrdinal]. Element offset = ((physicalPage*P + slotInPage)*Hkv + head)*dh + feature. Page table lookups are O(1) array access; page IDs are deterministic once allocated."
+      },
+      {
+        "title": "Physical storage layout and free list",
+        "body": "Physical K and V arrays are [physicalPages, P, Hkv, dh] allocated once at construction. freePages is a list of available page IDs, managed as a stack (pop to allocate, append to free). Free operation appends all pages of a layer to freePages and clears the page table, enabling reuse without shrinking arrays."
+      },
+      {
+        "title": "Allocator reporting and fragmentation",
+        "body": "allocatorReport() computes liveTokens (sum of counts across layers), internalFragmentation (allocatedPages * P - liveTokens), and largestContiguousFreeRun (longest consecutive free page ID run). Internal fragmentation is unavoidable with partial pages; free runs reveal if the next allocation will succeed."
+      },
+      {
+        "title": "Exhaustion and error handling",
+        "body": "pageUnavailable error thrown if a new logical page is required but freePages is empty. This is the point of paging: exhaustion is detectable before overflowing the pool. A properly integrated serving system calls free() when requests complete to return pages and avoid exhaustion."
+      }
+    ]
+  },
+  "028": {
+    "strategy": "Store K and V as INT8 with per-vector Float32 scales. For each appended K or V token/head vector, find its maximum absolute value, compute scale = max / 127 (or 1 if max=0), quantize each element q_i = clamp(round(x_i / scale), -127, 127), and store both q_i and scale. On read, dequantize by multiplying q_i * scale, returning Float32. Metal kernel dequantizes on-the-fly during score and value accumulation, avoiding materialized dequantized storage.",
+    "invariant": "K and V scales are independent (stored separately) to avoid coupling their dynamic ranges. Quantized elements are clamped to [-127, 127]. Dequantization returns Float32, seamlessly feeding into Float32 attention accumulation. Scale array has shape [L, C, Hkv] with one entry per token/head vector (6 entries for T=3, Hkv=2 per K and per V).",
+    "pitfall": "Sharing K and V scales (using one scale per token/head for both K and V). If K ranges [-2, 2] (scale=2/127) and V ranges [-10, 10] (scale=10/127), a shared scale over-quantizes one and under-quantizes the other, losing precision or saturating. Per-vector independence is mandatory to preserve both K and V fidelity.",
+    "points": [
+      {
+        "title": "Symmetric INT8 quantization formula",
+        "body": "scale = (max(|x|) == 0) ? 1 : max(|x|) / 127. All-zero vectors use scale 1 and stay zero. Maximum element-wise error is bounded by ~0.5*scale due to rounding. For x=[0.5, -1.0], scale=1/127, q=[64, -127], x_hat=[0.503, -1.0]—less than 1% error per element."
+      },
+      {
+        "title": "Byte accounting and metadata overhead",
+        "body": "INT8 elements: L*C*Hkv*dh bytes. K scales: L*C*Hkv*4 bytes (Float32). V scales: L*C*Hkv*4 bytes. Total INT8 cache ≈ 0.5x Float32 element bytes plus 2x scale metadata. For large dh, element savings dominate; for small dh, metadata overhead is significant."
+      },
+      {
+        "title": "Metal dequantization during attention",
+        "body": "Metal kernel loads Int8 k[d] and k_scale, computes Float32(k[d])*k_scale on-the-fly during score = sum(query[d]*dequantized_k[d]). No intermediate dequantized K/V buffer needed, amortizing scale multiplication across the dot product and saving GPU memory."
+      },
+      {
+        "title": "Error validation and convention checking",
+        "body": "Result compares max element-wise error against original Float K/V. Expected error should be low (<1/127 * max_range) if conventions are correct. Large errors often indicate a convention bug (e.g., wrong scale formula, norm convention mismatch) rather than inherent quantization loss; verify against Problem 011 before attributing to quantization."
+      }
+    ]
+  }
+}

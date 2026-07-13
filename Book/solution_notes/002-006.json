@@ -1,0 +1,137 @@
+{
+  "002": {
+    "strategy": "Implements a tensor abstraction that maps logical multi-dimensional indices to physical linear-storage offsets using a stride vector. Decomposes index access into: (1) rank and dimension validation, (2) per-axis bounds checking (0 ≤ i_a < d_a), (3) offset computation via the formula o(i) = base_offset + Σ(i_a * s_a), and (4) element retrieval. Provides FloatTensorView for arbitrary strides and shapes, and FloatTensor for contiguous row-major storage. All arithmetic uses Swift's multipliedReportingOverflow and addingReportingOverflow to detect Int overflow during stride computation and offset accumulation.",
+    "invariant": "For rank-r tensor with shape [d_0,...,d_{r-1}], row-major strides satisfy s_{r-1}=1 and s_a = d_{a+1}*s_{a+1}. Element count = Π d_a must not overflow Int.max. Every logical index must obey 0 ≤ i_a < d_a. For non-empty tensors, the maximum addressable offset base_offset + Σ((d_a-1)*s_a) must be strictly less than storage.count. Empty tensors (element count = 0) are valid with offset ≤ storage.count.",
+    "pitfall": "Overflow in element count or offset computation is silent without explicit checks. A shape whose dimension product exceeds Int.max, such as [Int.max, 2], must throw instead of wrapping. A view [2,3] with strides [1,2] instead of [3,1] changes the row/column mapping and produces incorrect values. Forgetting to validate base_offset ≥ 0 before adding relative offsets allows an invalid negative base. Transposing a view (swapping shape and strides) is free, but reshaping a non-contiguous view throws—confusion here breaks reshape-based view caching.",
+    "points": [
+      {
+        "title": "Row-Major Stride Derivation",
+        "body": "Strides are computed right-to-left, working backward from the last axis. The last axis always has stride 1. For axis a (from r-2 down to 0), stride[a] = shape[a+1] * stride[a+1]. For shape [2,3,4], strides are: [12, 4, 1]. This ensures the last dimension is contiguous in storage—neighboring elements differ by 1 storage position."
+      },
+      {
+        "title": "Logical vs. Physical Distinction",
+        "body": "A view is a shape + strides + offset that reinterprets existing storage. A transpose swaps shape and strides without moving data; a reshape with a transposed view throws TensorError.reshapeRequiresContiguousLayout. Materialization (copying to new contiguous storage) is necessary when the consumer requires a different stride order or when tiling a GPU kernel needs packed access patterns."
+      },
+      {
+        "title": "Overflow Detection at Every Arithmetic Step",
+        "body": "The stride derivation loop multiplies dimensions right-to-left, checking multipliedReportingOverflow after each product. The offset computation adds i_a * s_a into a running sum, checking both operations for overflow. For example, [Int.max, 2] cannot have a representable element count, so rowMajor must throw TensorError.elementCountOverflow rather than construct wrapped strides."
+      },
+      {
+        "title": "Bounds Guarantee for Non-Empty Views",
+        "body": "For a view with non-zero element count, the implementation computes the maximum offset reached by any valid index: (shape[0]-1)*strides[0] + ... + (shape[r-1]-1)*strides[r-1], adds base_offset, and asserts this is strictly less than storage.count. This guarantee ensures that layout.offset(for: validIndex) never accesses beyond the buffer."
+      },
+      {
+        "title": "Zero-Sized and Scalar Tensors",
+        "body": "A tensor with element count 0 (e.g., shape [2,0,3]) is valid and poses no overflow risk because the maximum offset calculation short-circuits (if layout.elementCount == 0, only check offset ≤ storage.count). A scalar tensor has shape [] and rank 0; it accesses storage[base_offset] and is valid as long as base_offset < storage.count."
+      }
+    ]
+  },
+  "003": {
+    "strategy": "Materializes a rank-two transpose by creating a new storage array and reindexing each element from [r,c] → [c,r]. CPU implementation iterates rows then columns of input, computing both source and destination offsets (src = r*C+c, dst = c*R+r), and copies directly. GPU implementation decomposes the matrix into 16×16 tiles. Each threadgroup cooperatively loads one tile into shared memory (with 16×17 padding to avoid bank conflicts), then stores it transposed. Handles partial tiles at edges with guarded reads and writes.",
+    "invariant": "Output element at [c,r] equals input element at [r,c] in value. For row-major layout, input offset is r*C+c and output offset is c*R+r. The GPU shared-memory transposition requires a threadgroup_barrier after loads (before any store) to ensure all 256 lanes have finished reading before column stores begin. Padded lanes (outside matrix bounds) skip both load and store; barrier participation is unconditional.",
+    "pitfall": "During the transposed scratch read, neighboring threads access different rows at the same column. A power-of-two row stride can repeat the same bank mapping; declaring the tile as [16][17] changes that stride and avoids the repeated mapping described by the lesson. Omitting the transpose barrier allows threads to read data before a peer has written it. Forgetting the bounds guard on edge tiles (for example, not checking inputRow < shape.x before loading) can read outside the input or write outside the output.",
+    "points": [
+      {
+        "title": "Index Mapping and Offset Computation",
+        "body": "The transpose swaps logical axes: B[c,r] = A[r,c]. Row-major storage maps [r,c] to offset r*C+c (input) and [c,r] to offset c*R+r (output). The CPU path loops over rows r and columns c of the input, computes both offsets, and copies storage[r*C+c] to output[c*R+r]. Example: [1,2,3,4,5,6] shaped [2,3] transposes to [1,4,2,5,3,6] shaped [3,2]."
+      },
+      {
+        "title": "View vs. Materialization Trade-off",
+        "body": "A transposed view (FloatTensorView with swapped shape and strides) is zero-copy but changes stride interpretation for downstream kernels. A materialized transpose copies all elements to a new contiguous layout, enabling coalesced GPU access and simplifying consumer code. The choice depends on whether downstream kernels expect row-major strides or can handle arbitrary strides."
+      },
+      {
+        "title": "Shared-Memory Bank Padding",
+        "body": "A square 16×16 Float tile has a power-of-two row stride of 16 elements. The transposed access tile[x][y] walks down rows at a fixed column, so that stride can repeatedly select the same bank mapping. Declaring tile[16][17] changes the scratch row stride from 16 to 17 elements and avoids that repeated pattern without relying on a particular bank count or threadgroup-memory capacity."
+      },
+      {
+        "title": "Barrier and Synchronization Points",
+        "body": "After all 256 threads load their [localPosition.y][localPosition.x] values into the shared tile, threadgroup_barrier(mem_flags::mem_threadgroup) ensures visibility. Threads then read tile[localPosition.x][localPosition.y] (transposed indices). Without the barrier, a store in one thread might happen before a read in another, causing data races. The 16×17 padding doesn't eliminate the need for the barrier—it only eliminates bank conflicts."
+      },
+      {
+        "title": "Partial-Tile Edge Handling",
+        "body": "When inputRow >= shape.x or inputColumn >= shape.y, the load is skipped (the conditional guards the store to tile). Similarly, on output, if outputRow >= shape.y or outputColumn >= shape.x, the store is skipped. This allows matrices with dimensions not divisible by 16 (e.g., 17×19) to transpose correctly: the incomplete tile is padded with uninitialized values, which are never written to output."
+      }
+    ]
+  },
+  "004": {
+    "strategy": "Implements matrix-vector multiplication y = W*x as M independent dot products, one per output element. CPU oracle iterates rows m, then columns k, accumulating y_m = Σ_k W[m,k]*x[k] in Float32. GPU dispatches one threadgroup per output row. Threads within the group cooperatively reduce over K: thread i computes partial sum Σ_j W[row, i + j*threadgroupWidth] * x[i + j*threadgroupWidth], storing in shared memory. After barrier, a tree reduction (stride 128→64→32→...→1) produces the final sum in partials[0].",
+    "invariant": "Each output y_m is exactly the dot product of matrix row m and the input vector, computed as Σ_k W[m,k]*x[k]. Shape contract: [M,K] × [K] → [M]. If K=0, all outputs are zero (empty sum). Accumulation is Float32 throughout. For thread i in the reduction tree, partials[i] must contain the sum of all products computed by thread i before the barrier.",
+    "pitfall": "Decode GEMV has low arithmetic intensity under the course's minimum Float32 traffic model: FLOPs = 2*M*K, bytes_moved = 4*(M*K + K + M), and intensity approaches 0.5 FLOP/byte when matrix traffic dominates. With illustrative peaks of 100 GB/s and 1000 GFLOP/s, the bandwidth roof is therefore about 50 GFLOP/s. Also, when K > threadgroupWidth (256), the lane loop must advance by 256 or it under-sums the row. Starting the tree reduction at stride 64 instead of 128 likewise omits half of a 256-lane group's partials.",
+    "points": [
+      {
+        "title": "Row-Wise Reduction Decomposition",
+        "body": "Each output y_m is independent: y_m = Σ_k W[m,k]*x[k]. The CPU oracle uses two loops—rows outside and columns inside—and accumulates one Float per row. The GPU preserves the same row-wise dot-product definition while distributing columns through a lane-strided loop and combining lane partials with a threadgroup reduction."
+      },
+      {
+        "title": "Threadgroup Collective Reduction",
+        "body": "One threadgroup processes one row. All 256 threads cooperatively sum the K elements of that row. Thread i sums x[i], x[i+256], x[i+512], ..., storing partial sums in partials[i]. After threadgroup_barrier, a binary tree reduces: stride 128 sums partials[i] += partials[i+128] (if i < 128), then stride 64, ..., down to stride 1. Thread 0 then writes partials[0] to output[row]."
+      },
+      {
+        "title": "Strided Loop for K > Threadgroup Width",
+        "body": "When K = 300 > 256, every lane processes its first column i, and lanes 0 through 43 also process i+256. Advancing by threadgroupWidth assigns every column to exactly one lane. When K < 256, lanes with i >= K execute no product and store 0 in partials[i], so they contribute the additive identity to the reduction."
+      },
+      {
+        "title": "Tree-Reduction Barrier Discipline",
+        "body": "Between each stride halving (stride/=2), a threadgroup_barrier ensures all additions are visible. For a 256-thread group, the tree has 8 levels: stride 128, 64, 32, 16, 8, 4, 2, 1. Each level has a barrier inside the stride loop. At stride 1, only thread 0 holds the full sum; thread 0 (and only thread 0) writes output[row]."
+      },
+      {
+        "title": "Weight Streaming and Arithmetic Intensity",
+        "body": "A [4096, 4096] one-token projection performs 2*4096*4096 = 33,554,432 FLOPs. The minimum Float32 model reads 64 MiB of weights and 16 KiB of vector data, then writes 16 KiB of output, giving about 0.5 FLOP/byte. With illustrative peaks of 100 GB/s and 1000 GFLOP/s, its bandwidth roof is about 50 GFLOP/s, so the roofline model classifies it as memory-limited. GEMM can raise intensity by reusing weights across token rows during prefill."
+      }
+    ]
+  },
+  "005": {
+    "strategy": "Implements C = A*B where each output cell C[m,n] = Σ_k A[m,k]*B[k,n]. CPU oracle uses a triply-nested loop: rows (m), columns (n), inner dimension (k). GPU algorithm tiles the output: each threadgroup computes a 16×16 block of C. The K dimension is split into chunks of width 16. For each chunk, the group cooperatively loads a 16×k_chunk slice of A and a k_chunk×16 slice of B into shared memory (zero-filled at out-of-bounds positions), synchronizes, accumulates the partial outer products, then moves to the next K chunk. After all chunks, threads write their output cells (guarded against out-of-bounds writes).",
+    "invariant": "Each output cell C[m,n] = Σ_k A[m,k]*B[k,n]. Shape contract: [M,K] × [K,N] → [M,N]. Partial K chunks are zero-filled, so out-of-bounds reads produce 0, and 0*0 products contribute 0 to the sum (numerically correct). All accumulation is Float32. The tile accumulation loop iterates 16 inner products per K chunk; after all chunks, the sum is complete.",
+    "pitfall": "Incorrect K-chunk count: tileCount = (K + 15) / 16, not K / 16. For K=19, correct is ceil(19/16)=2; incorrect tileCount=1 produces incomplete sums. Confusing shape components: shape.x is M, shape.y is K, shape.z is N; code using shape.z for inner dimension fails. Forgetting the second threadgroup_barrier (after accumulating one K chunk) allows a thread to overwrite shared memory before peers finish reading it. Out-of-bounds writes to output (when row >= M or column >= N) corrupt adjacent memory; the guard if (row < shape.x && column < shape.z) prevents this. Zero-filling is crucial: if shared memory is uninitialized, garbage products corrupt the sum.",
+    "points": [
+      {
+        "title": "Output Tile Decomposition",
+        "body": "GEMM decomposes [M,N] output into 16×16 tiles, one per threadgroup. Dispatching (M+15)/16 × (N+15)/16 groups ensures complete coverage. Each group computes all 16×16 cells in its tile by iterating over K in chunks; one group is responsible for output[groupY*16:(groupY+1)*16, groupX*16:(groupX+1)*16]."
+      },
+      {
+        "title": "Data Reuse via K Tiling",
+        "body": "For each K chunk, the group loads a 16×16 slice of A and a 16×16 slice of B into scratch. Every loaded A value is consumed by 16 output columns, and every loaded B value is consumed by 16 output rows before the next chunk overwrites scratch. This is 16-way reuse within a full output tile. Under the course's ideal minimum-traffic model, a square [D,D] GEMM has intensity 2*D^3 / (12*D^2) = D/6 FLOP/byte; actual traffic depends on whether the implementation realizes that reuse across the full matrix."
+      },
+      {
+        "title": "K-Chunk Iteration and Count",
+        "body": "Let tileCount = (K + 15) / 16. For each tileIndex from 0 to tileCount-1, the group loads lhsColumn = tileIndex*16 + localPosition.x from A and rhsRow = tileIndex*16 + localPosition.y from B. The loop index inner goes 0..15, and sum += lhsTile[localPosition.y][inner] * rhsTile[inner][localPosition.x]. For K=19, tileCount=2 (ceiling division); the second chunk loads indices [16,17,18] with zero-fill for unused lanes."
+      },
+      {
+        "title": "Partial Tile Zero Filling",
+        "body": "When loading lhsColumn >= K or rhsRow >= K, the element is set to 0.0. When writing output, if row >= M or column >= N, the store is skipped. Zero-filling is numerically safe: 0*anything = 0 contributes 0 to the sum. Example: for K=19 in the second chunk, lhsColumn ∈ {16,17,18}, and loads for lhsColumn ∈ {19..31} are zero-filled. Without zero-filling, uninitialized shared memory would corrupt the result."
+      },
+      {
+        "title": "Barrier Synchronization at Chunk Boundaries",
+        "body": "A threadgroup_barrier follows each inner-product loop (stride-16 inner products per K chunk). This ensures all threads have read lhsTile and rhsTile before the group writes new data for the next chunk. A second barrier follows the chunk load. Without barriers, racing writes and reads corrupt the tile. Correct placement: (1) load both tiles, (2) barrier, (3) loop inner products, (4) barrier, (5) next chunk. Incorrect placement (barrier inside the inner loop) causes false waiting."
+      }
+    ]
+  },
+  "006": {
+    "strategy": "Decouples the roofline model (a prediction based on algorithm properties and assumed machine peaks) from measurement (observed elapsed time). RooflineModel.predict computes arithmetic intensity I = FLOPs / bytes, bandwidth ceiling = I * peakBandwidth (GB/s), and model ceiling = min(peakCompute, bandwidthCeiling). Classification: if bandwidthCeiling < peakCompute, memory-limited; if bandwidthCeiling > peakCompute, compute-limited; if equal, balanced. RooflineMeasurement converts elapsed nanoseconds into achieved GFLOP/s and effective GB/s. RooflineBenchmark collects samples across iterations, sorts them, and returns the median to suppress tail noise from OS preemption.",
+    "invariant": "Arithmetic intensity is a property of the algorithm (chosen FLOPs and bytes), not the system. The roofline model is a prediction under stated assumptions (peak values, traffic model); it is not a measurement. Measured throughput is an observation of one implementation on one run, subject to noise and system variance. The model ceiling is valid only if peak assumptions and traffic counts match the actual system. A measured result above the model ceiling indicates an incorrect assumption, not a violation.",
+    "pitfall": "Confusing algorithmic minimum bytes with traffic measured at a particular memory hierarchy. Cache hits can reduce external traffic, while cache-line fetches, write allocation, copies, and coherency can add traffic; the model is meaningful only when its byte definition is stated. For GEMV, this course uses 4*(M*K+K+M) logical bytes. The benchmark sorts elapsed samples and selects samples[count/2], which reduces the influence of large outliers but does not remove all timing variance. Peak compute and bandwidth are explicit assumptions, not properties detected by the implementation.",
+    "points": [
+      {
+        "title": "Arithmetic Intensity Computation",
+        "body": "Intensity I = FLOPs / bytes_moved (FLOP/byte). For GEMV [M,K]×[K], FLOPs = 2*M*K and minimum Float32 bytes = 4*(M*K+K+M), so I = 2*M*K / (4*(M*K+K+M)) and approaches 0.5 when matrix traffic dominates. For GEMM [M,K]×[K,N], FLOPs = 2*M*K*N and minimum bytes = 4*(M*K+K*N+M*N). For square M=K=N=D, I = 2*D^3/(12*D^2) = D/6."
+      },
+      {
+        "title": "Roofline Prediction",
+        "body": "Given intensity I (FLOP/byte), peakCompute P_C (GFLOP/s), and peakBandwidth P_B (GB/s): bandwidthCeiling = I * P_B, predictedCeiling = min(P_C, bandwidthCeiling). The ridge point is P_C / P_B; below this, bandwidth is limiting; above, compute is limiting. Example: P_C=1000, P_B=100, ridge=10 FLOP/byte. A workload with I=5 has bandwidthCeiling = 5*100=500 GFLOP/s < 1000, so it is memory-limited."
+      },
+      {
+        "title": "Bottleneck Classification",
+        "body": "Compare bandwidthCeiling to peakCompute: (1) if bandwidthCeiling < peakCompute, the model is memory-limited; (2) if bandwidthCeiling > peakCompute, the model is compute-limited; (3) if equal, it is balanced. This names the lower modeled roof under the stated intensity and peak assumptions. It does not prove what limits a particular implementation; measurements and a clearly defined timing boundary are still required."
+      },
+      {
+        "title": "Measurement vs. Prediction",
+        "body": "A model predicts a ceiling under stated assumptions; a measured result records one implementation and timing boundary. If measured GFLOP/s exceeds the model ceiling, recheck the workload FLOPs, byte model and memory level, peak assumptions, and unit conversions. Launches, copies, and synchronization can explain a result below the ceiling, but they cannot explain one above it. An above-ceiling observation therefore exposes a mismatch between the model assumptions and the measurement."
+      },
+      {
+        "title": "Median Aggregation for Robust Benchmarking",
+        "body": "RooflineBenchmark measures each operation with DispatchTime.now().uptimeNanoseconds, sorts the K durations, and selects samples[K/2]. This is the middle sample for odd K and the upper middle sample for even K. In the illustrative set [100, 101, 105, 500, 501] ns, that rule returns 105 ns while the mean is 241.4 ns, demonstrating the median's lower sensitivity to extreme tail samples."
+      }
+    ]
+  }
+}

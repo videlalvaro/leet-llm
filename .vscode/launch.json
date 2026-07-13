@@ -1,0 +1,64 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:leet-llm}",
+            "name": "Debug leetllm",
+            "target": "leetllm",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug leetllm"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:leet-llm}",
+            "name": "Release leetllm",
+            "target": "leetllm",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release leetllm"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:leet-llm}",
+            "name": "Debug leetllm-studio",
+            "target": "leetllm-studio",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug leetllm-studio"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:leet-llm}",
+            "name": "Release leetllm-studio",
+            "target": "leetllm-studio",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release leetllm-studio"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:leet-llm}",
+            "name": "Debug leetllm-runner",
+            "target": "leetllm-runner",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug leetllm-runner"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:leet-llm}",
+            "name": "Release leetllm-runner",
+            "target": "leetllm-runner",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release leetllm-runner"
+        }
+    ]
+}

@@ -1,0 +1,3 @@
+#include <metal_stdlib>
+using namespace metal;
+kernel void sliding_window_attention(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device float *o [[buffer(3)]], constant uint4 &shape [[buffer(4)]], constant uint4 &dims [[buffer(5)]], constant uint &window [[buffer(6)]], uint index [[thread_position_in_grid]]) { if (index >= shape.x * shape.z) return; for (uint d = 0; d < dims.x; ++d) o[index * dims.x + d] = 0.0f; }

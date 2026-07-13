@@ -1,0 +1,8 @@
+#include <metal_stdlib>
+using namespace metal;
+constant uint maxHeadDimension = 128;
+kernel void sliding_window_attention(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device float *o [[buffer(3)]], constant uint4 &shape [[buffer(4)]], constant uint4 &dims [[buffer(5)]], constant uint &window [[buffer(6)]], uint index [[thread_position_in_grid]]) {
+    if (index >= shape.x * shape.z) return; uint query = index / shape.z, qHead = index % shape.z, kvHead = qHead / dims.y, qPosition = dims.z + query, lower = qPosition + 1 > window ? qPosition - window + 1 : 0; float m = -INFINITY, l = 0.0f, accumulator[maxHeadDimension]; for (uint d = 0; d < dims.x; ++d) accumulator[d] = 0.0f;
+    for (uint key = 0; key < shape.y; ++key) { uint keyPosition = dims.w + key; if (keyPosition < lower || keyPosition > qPosition) continue; float score = 0.0f; for (uint d = 0; d < dims.x; ++d) score += q[(query * shape.z + qHead) * dims.x + d] * k[(key * shape.w + kvHead) * dims.x + d]; score *= rsqrt(float(dims.x)); float newM = max(m, score), alpha = isfinite(m) ? exp(m - newM) : 0.0f, beta = exp(score - newM); l = l * alpha + beta; for (uint d = 0; d < dims.x; ++d) accumulator[d] = accumulator[d] * alpha + beta * v[(key * shape.w + kvHead) * dims.x + d]; m = newM; }
+    for (uint d = 0; d < dims.x; ++d) o[(query * shape.z + qHead) * dims.x + d] = accumulator[d] / l;
+}

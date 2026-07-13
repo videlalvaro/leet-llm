@@ -1,0 +1,183 @@
+\usepackage{fontspec}
+\defaultfontfeatures{Ligatures=TeX}
+\setmainfont{TeX Gyre Pagella}
+\setsansfont{TeX Gyre Heros}
+\setmonofont{DejaVu Sans Mono}[Scale=0.82]
+\newfontfamily\inlinecodefont{DejaVu Sans Mono}[Scale=0.76]
+\DeclareTextFontCommand{\texttt}{\inlinecodefont}
+\setlength{\emergencystretch}{5em}
+\raggedbottom
+
+\usepackage{microtype}
+\usepackage{xcolor}
+\definecolor{LeetInk}{HTML}{17212B}
+\definecolor{LeetBlue}{HTML}{2E668F}
+\definecolor{LeetBlueSoft}{HTML}{E8F2F8}
+\definecolor{LeetGreen}{HTML}{28705D}
+\definecolor{LeetGreenSoft}{HTML}{E9F4EF}
+\definecolor{LeetGold}{HTML}{9A6915}
+\definecolor{LeetGoldSoft}{HTML}{FBF2DE}
+\definecolor{LeetRed}{HTML}{A5453F}
+\definecolor{LeetRedSoft}{HTML}{FBEDEC}
+\definecolor{LeetCode}{HTML}{F4F6F7}
+\definecolor{LeetRule}{HTML}{C7D1D8}
+
+\usepackage[most]{tcolorbox}
+\tcbset{
+  enhanced,
+  breakable,
+  boxrule=0.55pt,
+  arc=2pt,
+  before skip=8pt,
+  after skip=8pt,
+  left=8pt,
+  right=8pt,
+  top=7pt,
+  bottom=7pt,
+  fonttitle=\sffamily\bfseries
+}
+\newtcolorbox{chapterfocus}{
+  title=Chapter focus,
+  colback=LeetBlueSoft,
+  colframe=LeetBlue
+}
+\newtcolorbox{exercisebox}[1][]{
+  title=Exercise,#1,
+  colback=LeetGoldSoft,
+  colframe=LeetGold
+}
+\newtcolorbox{hintbox}[1][]{
+  title=Hint,#1,
+  colback=LeetGoldSoft,
+  colframe=LeetGold
+}
+\newtcolorbox{solutionstrategy}{
+  title=Solution strategy,
+  colback=LeetGreenSoft,
+  colframe=LeetGreen
+}
+\newtcolorbox{implementationpoint}[1][]{
+  title=Implementation point,#1,
+  colback=LeetBlueSoft,
+  colframe=LeetBlue
+}
+\newtcolorbox{invariantbox}{
+  title=Correctness invariant,
+  colback=LeetGreenSoft,
+  colframe=LeetGreen
+}
+\newtcolorbox{pitfallbox}{
+  title=Common failure mode,
+  colback=LeetRedSoft,
+  colframe=LeetRed
+}
+\newtcolorbox{readingguide}{
+  title=How to read the listing,
+  colback=white,
+  colframe=LeetRule,
+  fontupper=\small,
+  before upper=\sloppy
+}
+\renewenvironment{Shaded}{%
+  \begin{tcolorbox}[
+    enhanced jigsaw,
+    breakable,
+    colback=LeetCode,
+    colframe=LeetCode,
+    boxrule=0pt,
+    arc=0pt,
+    left=2mm,
+    right=1mm,
+    top=1mm,
+    bottom=1mm,
+    before skip=6pt,
+    after skip=6pt
+  ]%
+}{%
+  \end{tcolorbox}%
+}
+
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,calc,positioning,shapes.geometric}
+\tikzset{
+  diagram node/.style={
+    draw=LeetBlue,
+    fill=LeetBlueSoft,
+    rounded corners=2pt,
+    line width=0.55pt,
+    align=center,
+    text width=3.05cm,
+    minimum height=9mm,
+    inner sep=4pt,
+    font=\sffamily\footnotesize
+  },
+  diagram decision/.style={
+    diamond,
+    draw=LeetGold,
+    fill=LeetGoldSoft,
+    line width=0.55pt,
+    align=center,
+    text width=2.15cm,
+    aspect=1.8,
+    inner sep=1.5pt,
+    font=\sffamily\scriptsize
+  },
+  diagram edge/.style={-{Stealth[length=2.2mm]},draw=LeetInk!72,line width=0.6pt},
+  diagram edge label/.style={
+    fill=white,
+    inner sep=1.5pt,
+    align=center,
+    font=\sffamily\scriptsize,
+    text=LeetInk
+  }
+}
+\usepackage{adjustbox}
+
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\setlist{itemsep=2pt,topsep=4pt}
+\setlist[enumerate]{leftmargin=*}
+\setlist[itemize]{leftmargin=*}
+
+\usepackage{fvextra}
+\fvset{
+  breaklines=true,
+  breakanywhere=true,
+  fontsize=\scriptsize,
+  numbers=left,
+  numbersep=7pt,
+  frame=none
+}
+
+\usepackage{titlesec}
+\titleformat{\chapter}[display]
+  {\sffamily\bfseries\color{LeetInk}}
+  {\filleft\fontsize{42}{44}\selectfont\color{LeetBlue}\thechapter}
+  {5pt}
+  {\titlerule[0.7pt]\vspace{8pt}\Huge}
+\titlespacing*{\chapter}{0pt}{-18pt}{24pt}
+\titleformat{\section}{\Large\sffamily\bfseries\color{LeetInk}}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\large\sffamily\bfseries\color{LeetInk}}{\thesubsection}{0.7em}{}
+
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\sffamily\small\nouppercase{\leftmark}}
+\fancyhead[R]{\sffamily\small LeetLLM Companion}
+\fancyfoot[C]{\sffamily\small\thepage}
+\renewcommand{\headrulewidth}{0.35pt}
+
+\usepackage{caption}
+\captionsetup{font=small,labelfont={sf,bf},width=0.92\textwidth}
+\usepackage{etoolbox}
+\AtBeginEnvironment{longtable}{\small}
+\AtBeginEnvironment{quote}{\itshape}
+
+\AtBeginDocument{
+  \hypersetup{
+    pdfcreator={Pandoc and LuaLaTeX},
+    pdfsubject={A hands-on companion to transformer inference on Apple Silicon}
+  }
+}

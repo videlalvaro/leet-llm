@@ -1,0 +1,209 @@
+{
+  "013": {
+    "strategy": "Embedding lookup is an indexed gather of selected rows from a [V,D] table driven by token IDs. Tied unembedding projects the gathered embeddings against every row of the same table via dot product, materially a row-major GEMV. Two separate access patterns—gather for lookup efficiency, dense projection for unembedding—share one parameter table to reduce model size. The implementation first reserves and fills embeddings by scattering token-indexed rows, then fills logits [S,V] by nested loops: for each sequence, for each vocabulary word, dot the gathered embedding row with the vocabulary word row from the table.",
+    "invariant": "Every token ID must satisfy 0 ≤ t < V. Embeddings are rows from the table selected by these IDs; logits equal embedded vectors multiplied by table rows transposed. Tying reduces parameters without eliminating the dense projection work; unembedding is not a lookup.",
+    "pitfall": "Returning zero logits when embeddings are correctly gathered. The gather succeeds but the unembedding dot products are omitted or incorrectly computed, producing incorrect final logits.",
+    "points": [
+      {
+        "title": "Token ID validation and row-major offset mapping",
+        "body": "Each token ID t maps to byte offset t * D within the [V,D] table stored row-major. Metal kernels extract tensor dimensions from shape[0]=V, shape[1]=D; CPU code uses table.shape[0] and table.shape[1]. Contract validation rejects t < 0, t ≥ V, or non-matrix tables before any arithmetic."
+      },
+      {
+        "title": "Gather as indexed copy, not projection",
+        "body": "Embedding lookup copies entire rows from the table into a contiguous [S,D] buffer using token indices as addresses. No matrix multiplication occurs; this is a memory read pattern, not a linear combination."
+      },
+      {
+        "title": "Tied unembedding as GEMV with table rows",
+        "body": "Logits [S,V] = embeddings [S,D] @ table.T [D,V], even though table is stored [V,D]. For each (sequence s, vocabulary v), logits[s,v] = sum over d of embeddings[s,d] * table[v,d]. This is a complete dense projection."
+      },
+      {
+        "title": "Two kernels or one fused operation",
+        "body": "Metal provides embedding_lookup and tied_unembedding as separate kernels: one gathers embeddings via tokenID-indexed reads, one computes logits via nested loops over vocabulary. Both must run; neither can be omitted."
+      }
+    ]
+  },
+  "014": {
+    "strategy": "Linear projections of hidden states [S,D] into Q, K, V subspaces are factored by head and feature dimension. Each projection multiplies by a weight matrix [D, Hq*dh] or [D, Hkv*dh], producing flat projections [S, Hq*dh] or [S, Hkv*dh]. These flat results are reinterpreted as [S,H,dh] tensors without copying, since contiguous columns map to contiguous head elements via column-index arithmetic: column c → head = c // dh, feature = c % dh. Head views enforce strides [H*dh, dh, 1] when underlying data is row-major.",
+    "invariant": "Head views require zero-copy interpretation only when projection columns are contiguous by head. Column c must map exactly to (head=c//dh, feature=c%dh) for the view to be valid. Weight matrix inner dimensions are exact contracts: W_Q has Hq*dh columns, W_K and W_V have Hkv*dh columns.",
+    "pitfall": "Materializing a [S,H,dh] copy of a flat [S,H*dh] projection when contiguity allows a zero-copy view. Incorrect head-to-column mapping causes wrong values to appear in wrong head positions.",
+    "points": [
+      {
+        "title": "Projection matrix dimensions and head factorization",
+        "body": "W_Q has shape [D, Hq*dh]; W_K and W_V have [D, Hkv*dh]. Each weight matrix inner dimension must be exact; the API validates these widths, not inferred column counts."
+      },
+      {
+        "title": "Head-to-column mapping via integer arithmetic",
+        "body": "Flat projection column c maps to head = floor(c / dh) and feature = c mod dh. For sequence s, flat[s,c] contains the feature value for head (c // dh). Iterating head first, then feature, produces the correct nested loop structure."
+      },
+      {
+        "title": "Strides and zero-copy head views",
+        "body": "A [S,D] @ [D,H*dh] multiplication produces flat [S,H*dh] with strides [H*dh, 1]. Reinterpreting as [S,H,dh] without copying requires strides [H*dh, dh, 1], which hold when columns are contiguous by head. This is automatic in row-major layout if columns 0..dh-1 belong to head 0, dh..2dh-1 to head 1, and so on."
+      },
+      {
+        "title": "Decode vs. prefill shapes and the same projection equation",
+        "body": "Decode uses Q [1,Hq,dh] @ weights [D, Hq*dh], a GEMV. Prefill uses Q [S,Hq,dh] @ weights [D, Hq*dh], a GEMM. Both invoke the same projection logic; only sequence length changes. Head shapes [S,Hq,dh] result from the same projection in both cases."
+      }
+    ]
+  },
+  "015": {
+    "strategy": "Rotary position embeddings apply 2D rotations to adjacent feature pairs within a rotary prefix [0, R). Each pair (2i, 2i+1) rotates by angle θ = position / B^(2i/R). For adjacent pair (a,b), the rotation is (a cos θ - b sin θ, a sin θ + b cos θ). Features [R, dh) copy unchanged. The same rotation formula applies to both Q and K, but position offsets can differ: absolute position = offset + sequence index.",
+    "invariant": "Unrotated pairs must be bit-for-bit unchanged; rotation applies only to [0, R) features in adjacent pairs. The angle formula uses exactly 2i in the exponent, not 2i+1 or other variants. Absolute position = offset + local sequence index; comparing positions for relative logic requires using offsets consistently for both Q and K.",
+    "pitfall": "Rotating the entire dh dimension instead of only [0, R). Using local sequence index as position instead of offset + sequence. Applying different conventions to Q and K so relative position encoding is broken. Forgetting to copy the suffix [R, dh) exactly.",
+    "points": [
+      {
+        "title": "Adjacent pair rotation formula and angle computation",
+        "body": "For pair index i (0-indexed), angle θ_i = position / base^(2*i/R). The pair (feature[2i], feature[2i+1]) rotates via x' = x cos θ - y sin θ, y' = x sin θ + y cos θ. This formula is applied identically to Q and K."
+      },
+      {
+        "title": "Rotary dimension R as even, strict prefix",
+        "body": "R must be positive, even, and satisfy R ≤ dh. Features [0, R) participate; features [R, dh) are copied bit-for-bit without rotation. When R = dh, the entire feature dimension rotates in adjacent pairs."
+      },
+      {
+        "title": "Offset-based absolute position semantics",
+        "body": "Absolute position for Q at local sequence q is queryPositionOffset + q. For K at local key k, it is keyPositionOffset + k. The relative position (difference) between Q and K positions encodes their separation, enabling relative position awareness."
+      },
+      {
+        "title": "Metal kernel pair iteration and feature layout",
+        "body": "The Metal kernel stride(from: 0, to: rotaryDimension, by: 2) pairs features. For pair starting at feature pairStart, the angle uses pair index pairStart/2. RoPE is applied per-head, per-sequence; strides index (sequence * heads + head) * dh + pairStart to access the pair start address."
+      }
+    ]
+  },
+  "016": {
+    "strategy": "Causal attention for one head computes scaled dot-product scores [Sq,Skv] between query and key, applies a causal mask (setting future scores to -∞ before softmax), then computes numerically stable row-wise softmax and applies attention weights to values. The implementation materializes the score matrix, computes the finite maximum per row, rescales all exponentials, normalizes, and sums weighted values in a second pass.",
+    "invariant": "Scores are initialized to -∞ and filled only for keys at positions ≤ query position. Softmax subtracts the row maximum before exponentiating to ensure numerical stability. The sum of attention weights over visible keys equals 1. Output is a weighted average of value rows, corresponding exactly to the normalized softmax probabilities.",
+    "pitfall": "Applying causal mask after softmax, allowing future logits to influence the normalization denominator. Computing softmax without subtracting the maximum, causing overflow when scores are large. Materializing and returning the score matrix instead of the weighted output. Omitting the causality check or using wrong position comparison (< instead of ≤).",
+    "points": [
+      {
+        "title": "Causal mask and position semantics",
+        "body": "Query at absolute position queryOffset + query; key at keyOffset + key. A key is visible only if keyOffset + key ≤ queryOffset + query. Set score[query, key] = -∞ for invisible keys before softmax. The causal predicate is applied per-element, not per-row."
+      },
+      {
+        "title": "Score computation and scaling",
+        "body": "Score = (Q[q] · K[k]) / √dh. Compute all visible dot products, scale by reciprocal square root of head dimension. Initialize invisible entries to -∞, preserving them through softmax."
+      },
+      {
+        "title": "Numerically stable softmax with finite maximum",
+        "body": "For each row of scores, find the maximum among finite entries. Subtract this maximum before exponentiating: weight = exp(score - maximum). Sum the weights (denominator), then divide each weight by the sum. This prevents overflow and underflow while preserving the normalized probability."
+      },
+      {
+        "title": "Two-pass implementation with materialized scores",
+        "body": "Metal provides causal_attention_scores and causal_attention_apply kernels. First kernel fills [Sq,Skv] score buffer, applying the causal mask and scale. Second kernel reads the score matrix, computes per-row softmax maximum and normalization, and produces [Sq,dh] output by weighted sum."
+      }
+    ]
+  },
+  "017": {
+    "strategy": "Multi-head attention extends one-head attention to H independent heads by adding an explicit head loop. Each (query, head) pair computes its own score vector, applies its own causal mask, normalizes with its own softmax maximum, and produces its own output slice. Heads are concatenated by layout, not summed: output [Sq,H,dh] places head slices side-by-side with strides [H*dh, dh, 1]. The implementation materializes per-head score rows and normalizes per head independently.",
+    "invariant": "Heads do not attend to one another. For head h, only Q[:,h,:], K[:,h,:], V[:,h,:] are used; no cross-head reads occur. Outputs are concatenated by position, not linearly combined. Query and KV head counts must be equal in Problem 017 (MHA constraint; Problem 018 relaxes this).",
+    "pitfall": "Reusing one head's K/V for all queries or all query heads. Summing head outputs instead of concatenating them. Incorrect index computation that mixes head indices across different tensors. Using query position from wrong index calculation.",
+    "points": [
+      {
+        "title": "Independent per-head computation and score rows",
+        "body": "For each query position and head, build a full visible-key score vector, find its maximum, compute softmax weights, and sum weighted values. Each head's softmax state (maximum, denominator) is private and must not be shared across heads."
+      },
+      {
+        "title": "Head loop nested explicitly in algorithm",
+        "body": "The loop structure is: for query, for head, build visible-key list, compute scores, softmax, output. Keeping the head loop explicit in source code exposes accidental cross-head indexing bugs that would silently corrupt results."
+      },
+      {
+        "title": "Concatenation as layout, not reduction",
+        "body": "Output [Sq,H,dh] with strides [H*dh, dh, 1] places each head's output contiguously in memory but in head-major column order. Downstream processing (e.g., output projection) reads this as [Sq, H*dh] flat, treating each head's features as separate columns, not as separate tensors to be summed."
+      },
+      {
+        "title": "Metal kernel dispatch over (query, head) pairs",
+        "body": "The Metal kernel indexes as (query * H + head), assigning one (query, head) pair per thread. Each thread computes score visibility, applies its own softmax loop, and writes output. Barriers and shared state are per-thread-group, not per-head; head-local state (maximum, denominator) resides in registers."
+      }
+    ]
+  },
+  "018": {
+    "strategy": "Grouped query attention maps query heads to KV heads via contiguous grouping: kvHead = queryHead / groupSize, where groupSize = Hq / Hkv. Hq must be divisible by Hkv. Each query head attends via its assigned KV head; multiple query heads can share one KV head. The attention equation is identical to Problem 017, but K/V lookups use the mapped kvHead instead of the original queryHead.",
+    "invariant": "Hq divisible by Hkv; groupSize = Hq / Hkv computed once. Query heads [0, g) map to KV head 0, [g, 2g) map to KV head 1, etc. MHA (Hq == Hkv, g=1) is the identity mapping; MQA (Hkv == 1, g=Hq) maps all query heads to KV head 0. The mapping must be contiguous by group, not modulo or other permutations.",
+    "pitfall": "Using modulo mapping (queryHead % Hkv) instead of integer division floor(queryHead / groupSize). Failing to validate Hq divisibility by Hkv. Confusing MQA and MHA in code, or implementing only one variant. Using wrong KV head indices due to off-by-one errors.",
+    "points": [
+      {
+        "title": "Group size and contiguous KV head mapping",
+        "body": "Group size = Hq / Hkv. Query heads are partitioned into Hkv contiguous groups of size g. Query heads [0, g) → KV head 0, [g, 2g) → KV head 1, and so on. This contiguity is essential for KV cache layout efficiency; modulo mapping breaks it."
+      },
+      {
+        "title": "MHA and MQA as mapping endpoints",
+        "body": "MHA: Hq == Hkv, g=1, identity mapping (each query head has its own KV head). MQA: Hkv == 1, g=Hq, all query heads map to KV head 0. GQA spans the middle: 1 < Hkv < Hq."
+      },
+      {
+        "title": "KV cache byte accounting per head configuration",
+        "body": "For one layer, storing both Float32 keys and values requires 2 * sequenceLength * Hkv * dh * 4 bytes. Equivalently, each KV head contributes 2 * sequenceLength * dh * 4 bytes. Query head count does not appear in this storage formula, so reducing Hkv reduces the K/V cache footprint when sequence length and head dimension stay fixed."
+      },
+      {
+        "title": "Metal kernel KV head mapping and grouped attention computation",
+        "body": "Metal kernel receives dims.y = groupSize. For queryHead, kvHead = queryHead / dims.y. K/V are indexed by (key * Hkv + kvHead) * dh + feature. This mapping is applied once per (query, queryHead) pair and held constant for all K/V reads in that row."
+      }
+    ]
+  },
+  "019": {
+    "strategy": "Online softmax eliminates score matrix materialization by maintaining running state (m, l, o) per head: m is the maximum score processed so far, l is the normalized sum of exponentials relative to m, and o is the weighted output sum also relative to m. For each new key score s and value v, update m' = max(m, s), then rescale old state by α = exp(m - m'), add new contribution β = exp(s - m'): l' = α*l + β, o' = α*o + β*v. After all visible keys, output = o / l. No score buffer exists; state resides in registers or threadgroup memory.",
+    "invariant": "When m increases, all prior terms must be rescaled by exp(old_m - new_m). If m was -∞ (empty state), α = 0 (old state contributes nothing). Denominator l and accumulator o scale by the same factor α. Final output equals true softmax within floating-point rounding of materialized softmax.",
+    "pitfall": "Forgetting to rescale old accumulator when maximum increases. Applying α multiplicatively to l and denominator but additively to o, or vice versa. Treating m = -∞ as a normal maximum instead of a sentinel (must set α = 0). Computing β incorrectly or failing to initialize state.",
+    "points": [
+      {
+        "title": "Running state (m, l, o) and the rescale factor α",
+        "body": "Maximum m starts at -∞. For each new score s, m' = max(m, s). Rescale factor α = exp(m - m'). If m was -∞, α = 0 (old state is discarded). If m is finite and s > m, then m' > m, so α < 1 (old state decays). α = 1 only when s ≤ m (no update)."
+      },
+      {
+        "title": "Synchronized updates to l and o under rescaling",
+        "body": "Both denominator and accumulator must scale by α when m changes. l' = α*l + β, o' = α*o + β*v. This preserves the invariant that l and o remain consistent with the current m."
+      },
+      {
+        "title": "Streaming without score buffer",
+        "body": "Keys and values are processed sequentially. No [Sq,Skv] score matrix is allocated; state (m, l, o) is O(dh) registers per (query, head). This reduces memory bandwidth and enables fusing multiple attention components in a single kernel."
+      },
+      {
+        "title": "Register-resident state and Metal private memory",
+        "body": "In Metal, register-resident accumulators (floats for m, l; array of floats for o) are declared in kernel scope. For dh ≤ 128, a private array accumulator[128] is standard. State persists across loop iterations without threadgroup memory pressure."
+      }
+    ]
+  },
+  "020": {
+    "strategy": "Tiled fused attention processes keys in 16-key tiles within a fused kernel. A threadgroup of 128 threads cooperatively processes one (query, head) pair. Threads compute score tiles in parallel, a single thread (local ID 0) updates running state (m,l) once per tile, then all threads cooperatively update the output accumulator using threadgroup memory for scores and weights. Three threadgroup barriers synchronize: after score computation, after state update, and after output update. No global score buffer exists; fusion boundary is one dispatch.",
+    "invariant": "Running state (m,l,o) updated once per 16-key tile, not per key. Tile maximum and tile sum of exponentials are computed and applied together via the rescale factor. All 128 threads participate in each barrier; partial-tile and non-causal entries have score -∞ and weight 0. Output written at final output location is guaranteed numerically equal to online softmax of the same sequence.",
+    "pitfall": "Rescaling accumulator once per key instead of once per tile. Omitting or misplacing barriers, causing data races between compute and read. Assuming tile boundaries align with causal or valid keys; partial final tile must be handled explicitly. Computing tile sum of weights but forgetting to include it in l update.",
+    "points": [
+      {
+        "title": "Key tile size and threadgroup memory layout",
+        "body": "Key tile size is 16. Threadgroup memory holds scores[16] and weights[16] shared by the 128 threads. Accumulator[128] for the head dimension features. State array [3] for (m, l, o's numerator). One thread group processes one (query, head) pair; dimensions are known at compile time."
+      },
+      {
+        "title": "Tile-level state update and rescaling",
+        "body": "After computing a tile's scores, thread 0 finds the tile maximum, computes m' = max(old m, tile max), rescale factor α = exp(old m - m'), and tile weight sum. Updates l' = α*l + tile sum, m' = new m. All 128 threads then rescale their feature accumulators by α and add tile contributions."
+      },
+      {
+        "title": "Three-tier barrier synchronization",
+        "body": "threadgroup_barrier(mem_flags::mem_threadgroup) after score computation ensures all scores visible to thread 0. Second barrier after state update ensures new state visible to all threads. Third barrier after output update ensures next tile sees consistent state."
+      },
+      {
+        "title": "Fusion and no quadratic intermediate",
+        "body": "Scores are computed, reduced to one [3] state, and output updated within a single dispatch with no global intermediate. Full attention ([Sq,Skv] scores) would require O(Sq * Skv) bytes; tiling eliminates this, retaining only [16] per tile."
+      }
+    ]
+  },
+  "021": {
+    "strategy": "Sliding window attention restricts visibility to keys within an inclusive absolute window [max(0, qPosition - W + 1), qPosition]. For each query, compute lower bound and upper bound; stream only keys whose absolute positions fall in range and update online (m,l,o) state. The visibility predicate replaces the causal mask; w must be ≥ 1. Window of 1 means position qPosition only; window ≥ context length equals full causal attention.",
+    "invariant": "Window lower bound = max(0, qPosition - W + 1), upper bound = qPosition, both inclusive. Only keys with keyPosition ∈ [lower, upper] participate in softmax and output. Window is a model policy (controls information flow), not a numerical approximation. Lowering W removes recent context permanently.",
+    "pitfall": "Using local sequence indices instead of absolute positions to compute bounds. Clamping the window to context length or other values, or applying position offsets incorrectly. Confusing windowed attention (information loss) with numerical approximation. Computing lower bound as qPosition - W instead of qPosition - W + 1.",
+    "points": [
+      {
+        "title": "Absolute position bounds and inclusive window range",
+        "body": "Query absolute position = queryOffset + query. Key absolute position = keyOffset + key. Window visibility: lower = max(0, qPosition - W + 1), upper = qPosition. A key is visible iff keyPosition ≥ lower AND keyPosition ≤ upper (both inclusive)."
+      },
+      {
+        "title": "Window of 1 as position-only attention",
+        "body": "W=1: lower = qPosition - 1 + 1 = qPosition, upper = qPosition. Only the current position is visible. Output equals V[qPosition] exactly (assuming position-aligned indices). This is a special case, not an error."
+      },
+      {
+        "title": "Window larger than context equals full causal attention",
+        "body": "If W ≥ available context, the lower bound naturally filters to the earliest available position and the predicate reduces to full causal (keyPosition ≤ qPosition). The window parameter is not clamped; the predicate naturally selects all available causal keys."
+      },
+      {
+        "title": "Online streaming with window predicate",
+        "body": "Metal and CPU implementations iterate all keys and check both causal and window predicates: keyPosition ≥ lower AND keyPosition ≤ upper. Keys outside this range contribute score = -∞ and weight = 0. Streaming updates (m,l,o) only for valid keys, automatically handling partial windows."
+      }
+    ]
+  }
+}

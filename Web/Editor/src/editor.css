@@ -1,0 +1,36 @@
+:root {
+  color-scheme: light dark;
+  font-family: "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+  background: #f7f8fa;
+}
+
+html,
+body,
+#editor {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  background: #f7f8fa;
+}
+
+.cm-editor {
+  width: 100%;
+  height: 100%;
+}
+
+.cm-scroller {
+  overflow: auto;
+  box-sizing: border-box;
+  padding: 12px 0;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root,
+  body {
+    background: #17191c;
+  }
+}

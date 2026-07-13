@@ -1,0 +1,23 @@
+title: "LeetLLM"
+subtitle: "A Hands-On Companion to Transformer Inference on Apple Silicon"
+author: "The LeetLLM Project"
+date: "2026"
+lang: en-US
+documentclass: book
+classoption:
+  - 11pt
+  - openany
+  - oneside
+papersize: letter
+toc: true
+toc-depth: 2
+numbersections: true
+geometry:
+  - top=0.78in
+  - bottom=0.70in
+  - inner=0.88in
+  - outer=0.78in
+colorlinks: true
+linkcolor: LeetBlue
+urlcolor: LeetBlue
+citecolor: LeetGreen

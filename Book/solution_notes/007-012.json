@@ -1,0 +1,164 @@
+{
+  "007": {
+    "strategy": "Maps three elementwise activation functions to individual GPU threads, one thread per element, leaving all tensor shape and contiguous row-major layout unchanged. ReLU computes max(0, x); GELU applies the tanh approximation with cubic term and sqrt(2/π) scale factor; SiLU multiplies x by its sigmoid gate. The `Activation` enum makes the formula choice visible at call sites, preventing GELU variants from hiding inside an unlabeled closure.",
+    "invariant": "Output shape and rank match input exactly. Each element is computed independently by its corresponding formula. Negative values are handled distinctly per activation: ReLU hard-zeros negatives; GELU and SiLU suppress rather than zero them.",
+    "pitfall": "Implementing exact GELU erf-based formula instead of the tanh approximation (test explicitly names geluTanhApproximation). Omitting the 0.044715 cubic coefficient or the sqrt(2/π) factor. Returning sigmoid(x) instead of x*sigmoid(x) for SiLU. Producing correct flat values but with wrong output shape.",
+    "points": [
+      {
+        "title": "Storage map, not nested shape loops",
+        "body": "The CPU reference maps over storage directly, then wraps the result with input.shape. This avoids flattening the logical contract to [N] even though physical layout is flat, preserving shape invariants."
+      },
+      {
+        "title": "GELU tanh approximation: x/2 * (1 + tanh(sqrt(2/π) * (x + 0.044715*x³)))",
+        "body": "The cubic term must be present. The constant is sqrt(2/π) ≈ 0.7978846. The half-scale factor multiplies the entire (1 + tanh(...)) result. This approximation matches common LLM implementations and differs from exact GELU."
+      },
+      {
+        "title": "SiLU retains suppressed negatives",
+        "body": "SiLU(x) = x / (1 + exp(-x)) does not zero negative x. The sigmoid gate lies between 0 and 1, suppressing magnitude but preserving sign. This is architecturally different from ReLU's hard cutoff."
+      },
+      {
+        "title": "Metal dispatch: one thread per element with no barriers",
+        "body": "Metal kernel has one thread per element, thread_position_in_grid = index. No threadgroup memory, no barriers, no dependencies. Bounds check for partial final threadgroup only."
+      },
+      {
+        "title": "Double oracle for Float32 validation",
+        "body": "Judge computes expected values in Double using the same formulas, then rounds once to Float. Tolerance is absolute 2e-6 plus relative 2e-5, catching precision issues without over-fitting to implementation order."
+      }
+    ]
+  },
+  "008": {
+    "strategy": "Decomposes the gated feed-forward into three explicit projection stages: gate projection (Wg*x) and up projection (Wu*x) both to hidden width H, elementwise SiLU gate activation multiplied by up values (Hadamard product), then down projection (Wd*h) back to output width O. CPU path evaluates sequentially in three visible loops. Metal fusion merges SiLU activation and multiplication into one elementwise kernel, removing the materialized SiLU intermediate while preserving composed semantics.",
+    "invariant": "Gate and up projections have identical shapes [H, D]. Output shape is [O] = [down.shape[0]]. Each gated hidden element depends on both the corresponding gate activation and its paired up value. Zero hidden width produces all-zero output vector of correct shape.",
+    "pitfall": "Omitting the down projection (tests reject failure mode when only returning gated hidden). Implementing as simple MLP (linear → nonlinear → linear) without the gate-up decomposition. Implementing gate as linear without SiLU activation. Returning sigmoid(gate) instead of (gate / (1 + exp(-gate))) * up for the gate operation.",
+    "points": [
+      {
+        "title": "Gate and up learn different features",
+        "body": "The two [H, D] matrices are not merged. Gate rows learn to produce modulation signals; up rows learn to supply values being modulated. SiLU sits between them, making the structure non-commutative."
+      },
+      {
+        "title": "SiLU suppresses but does not zero negatives",
+        "body": "Large negative gate values produce small but non-zero outputs (e.g., SiLU(-2) ≈ -0.238). This soft gating preserves information for backprop compared to ReLU's hard zero."
+      },
+      {
+        "title": "Metal gate fusion removes one intermediate",
+        "body": "The fused Metal kernel reads gate and up vectors once, computes SiLU and multiplication in registers, and writes hidden without materializing SiLU separately. This saves one buffer write, read, and dispatch."
+      },
+      {
+        "title": "Validation catches shape mismatches early",
+        "body": "Guards check input rank, gate/up shape equality, down hidden width matching, and inner dimension coherence before any indexing. Tests verify rejection of input rank, gate/up mismatch, and down width mismatch."
+      },
+      {
+        "title": "Relative tolerance 4e-5 across all three projections",
+        "body": "Judge accumulates gate and up in Double, applies SiLU formula in Double, multiplies in Double, then applies down in Double. Final values are rounded to Float once, tolerating accumulated rounding across all three stages."
+      }
+    ]
+  },
+  "009": {
+    "strategy": "Implements row-wise softmax by subtracting the row maximum from every logit (preventing overflow/underflow), then computing normalized exponentials. Metal kernel performs two threadgroup reductions: first finds the row maximum via binary tree, second accumulates the exponential sum. Both reductions use threadgroup memory barriers to synchronize partial results. Final normalization divides shifted exponentials by the summed denominator.",
+    "invariant": "Each output row is a probability distribution: nonnegative and sums to exactly one (within 3e-5 tolerance). Shift invariance holds: logits - m and logits_shifted - m_shifted produce identical probabilities for the same shift. At least one logit per row maps to zero after shift (since maximum logit - maximum = 0).",
+    "pitfall": "Naive exp(logit) overflow for large positive logits or underflow for large negative logits. Omitting max subtraction or applying it per-column instead of per-row. Returning uniform probabilities (tests verify this fails). Allowing threads to skip barriers based on out-of-bounds columns (all 256 threads must synchronize).",
+    "points": [
+      {
+        "title": "Max subtraction is numerically required, not optional",
+        "body": "Every shifted logit satisfies z_i - m ≤ 0, so exp(z_i - m) ∈ (0, 1]. The denominator sum includes at least the term exp(0) = 1, preventing underflow to zero even for finite, nonempty input."
+      },
+      {
+        "title": "Two-phase threadgroup reduction with barriers",
+        "body": "First phase: parallel threads compute partial maxima, tree reduction finds global max with barrier synchronization at each level. Second phase: threads compute shifted exponentials and partial sums, another tree reduction finds total denominator. Every thread participates in every barrier."
+      },
+      {
+        "title": "Threads must not skip barriers based on bounds",
+        "body": "Threads whose column range is out-of-bounds contribute -infinity to the max reduction and 0 to the sum reduction. They still reach every barrier to keep the threadgroup synchronized. Early return would deadlock."
+      },
+      {
+        "title": "Probability simplex tested independently of summation",
+        "body": "Judge checks both: expected probability values via Double oracle, AND that row sums equal 1. Uniform probabilities would pass the sum check but fail the value check, exposing missing nonlinearity."
+      },
+      {
+        "title": "1024-column Metal limit is pedagogical",
+        "body": "Threadgroup width 256 divides into 4 values per thread at 1024 columns. This bound is explicit in the API (rowWidthExceedsMaximum error) and reflects this first materialized implementation. Problem 019 addresses unbounded online softmax."
+      }
+    ]
+  },
+  "010": {
+    "strategy": "Reduces sum of squares across each row in parallel via threadgroup tree reduction, computes inverse RMS as rsqrt(mean_square + epsilon), then scales input by inverse RMS and multiplies by per-feature learned scale gamma. Metal kernel assigns one 256-thread group per row; threads accumulate squares for strided columns, reduce the sum, compute inverse RMS once, and write scaled output for their columns.",
+    "invariant": "Output shape matches input [R, D]. Each row's normalized mean square (before gamma) is exactly one. Gamma is applied with direct multiplication, not (1 + gamma). Epsilon sits inside the square root, before the reciprocal. All rows with valid inputs produce finite outputs.",
+    "pitfall": "Using (1 + gamma) instead of direct gamma multiplication (different model convention, test explicitly rejects this via mixed-gamma fixture). Placing epsilon before or after square root. Dividing by sqrt instead of using rsqrt (inverse square root). Using LayerNorm's centering logic. Computing gamma * (1 + gamma) or other compound scales.",
+    "points": [
+      {
+        "title": "RMSNorm omits centering, lowering cost vs LayerNorm",
+        "body": "No mean computation or subtraction. Only sum-of-squares reduction + square root + scale. This preserves non-zero mean across the residual stream, a different invariant than LayerNorm."
+      },
+      {
+        "title": "Epsilon must be added inside sqrt to prevent zero-division edge case",
+        "body": "For all-zero input, mean_square = 0. rsqrt(0 + epsilon) = rsqrt(epsilon), which is finite. Tests include all-zero row with epsilon = 0.25 to verify epsilon placement."
+      },
+      {
+        "title": "Gamma is direct per-feature multiplication",
+        "body": "output[i] = (input[i] / rms(input)) * gamma[i]. No bias term, no (1 + gamma) transform. This convention is part of model weight format compatibility and must be visible at the call site."
+      },
+      {
+        "title": "Threadgroup reduction with tree structure and barriers",
+        "body": "One 256-thread group per row. Each thread computes partial sum of squares for its strided columns. Tree reduction halves active range at each barrier level. All threads read the final shared result and compute the same inverseRMS."
+      },
+      {
+        "title": "Double oracle avoids sharing Float32 reduction precision",
+        "body": "Expected values accumulated in Double, then rounded to Float once. Tolerance: absolute 4e-5 plus relative 5e-5. Catches both overflow in squared values (tested with 1e18 magnitudes) and precision loss from Float32 accumulation."
+      }
+    ]
+  },
+  "011": {
+    "strategy": "CPU-only policy comparison: two explicit precision modes for residual stream updates. Float32 policy keeps each sum in Float32. Float16AfterEachAdd policy round-trips each sum through Float16 (converts to Float16 then back to Float32) after every addition, making storage loss observable and deterministic. Updates are applied in order; downcast timing is the only difference between policies.",
+    "invariant": "All updates are incorporated into the residual in the declared order. Downcast occurs at the policy boundary (immediately after each addition), not hidden in intermediate operations. Maximum absolute difference between policies is measurable and deterministic given the sequence.",
+    "pitfall": "Applying downcast only once at the end instead of after each addition (wrong timing changes the numerical result fundamentally). Ignoring updates or skipping additions. Using non-deterministic rounding or stochastic conversions. Computing the difference before conversion instead of after.",
+    "points": [
+      {
+        "title": "Policy boundary placement changes error propagation",
+        "body": "Float32 policy: errors accumulate at full precision within the residual stream, then interact with later layers' computations. Float16 policy: each update's precision loss is baked into the residual immediately, affecting all downstream layers. Neither is universally 'correct'—the choice is architectural."
+      },
+      {
+        "title": "Float16 ULP spacing grows with magnitude",
+        "body": "Near 4096, adjacent Float16 representable values are 4 apart. Adding 0.5 four times in Float32 gives 4098; with Float16 round-trip after each +0.5, the intermediate 4096.5 rounds back to 4096, so the final value stays 4096. Measurable loss is exactly 2."
+      },
+      {
+        "title": "Round-trip Float32 → Float16 → Float32 makes loss observable",
+        "body": "No per-value rounding logic needed. Storage loss appears automatically because Float16(Float32) truncates to Float16 representation, then converting back to Float32 reproduces the stored precision loss."
+      },
+      {
+        "title": "ResidualPrecisionComparison measures maximum absolute divergence",
+        "body": "Not statistical error or average divergence. The maximum tells you the worst-case precision loss across the entire tensor, making the cost of the policy choice reviewable."
+      },
+      {
+        "title": "Shape must match across all updates",
+        "body": "Each update must have the same shape as the initial residual. Test verifies rejection when update shapes differ. This constraint ensures residual addition is element-wise without broadcasting."
+      }
+    ]
+  },
+  "012": {
+    "strategy": "Fuses RMSNorm and GEMV into a single Metal kernel: computes row sum of squares, reduces to inverse RMS via threadgroup reduction, then accumulates dot products with weight rows using the normalized input directly (without materializing the normalized vector). Two reductions per kernel dispatch: first for RMS, second for dot product. Each threadgroup computes one output element.",
+    "invariant": "Output shape is [num_output_rows]. Composed equation is preserved: normalize input then project via weights. Normalized intermediate never materializes to global memory. Each threadgroup redundantly recomputes the same RMS for all output rows it processes. Epsilon remains inside the RMS square root.",
+    "pitfall": "Forgetting to normalize before projection (test rejects unnormalized projection that just multiplies input by weights). Syncing only the RMS reduction, not the dot product reduction. Computing RMS per-threadgroup instead of globally (leads to per-row redundancy, which is acceptable but different). Placing epsilon outside the square root.",
+    "points": [
+      {
+        "title": "Fusion removes write and read of normalized vector",
+        "body": "Separate pipeline: RMSNorm writes [D] normalized values, GEMV kernel reads them. Fused pipeline: one kernel normalizes in registers and immediately uses normalized values for dot products. Saves one buffer allocation, one write, one read, and one dispatch."
+      },
+      {
+        "title": "Composed semantics are preserved exactly",
+        "body": "y_i = Σ_j W[i,j] * (input[j] / rms(input)) * gamma[j]. Fusion changes storage and scheduling, not the equation. Epsilon is still inside rms sqrt, gamma is still direct multiplication."
+      },
+      {
+        "title": "Redundant per-threadgroup RMS computation",
+        "body": "Dispatch is one kernel per output row. Each threadgroup recomputes the same RMS from the entire input vector. This is redundant (RMS is shared across all output rows) but simpler than shared RMS state. Trade-off is documented and acceptable."
+      },
+      {
+        "title": "Two threadgroup reductions in one dispatch",
+        "body": "First reduction: threads accumulate input squares, tree-reduce to sum, compute inverseRMS. Barrier synchronizes. Second reduction: threads compute normalized * weight products, tree-reduce dot product sum. Only localIndex == 0 writes the final output."
+      },
+      {
+        "title": "Judge tests wide inputs crossing reduction boundary",
+        "body": "Input width 257 is tested with 256-thread threadgroup, forcing threads to loop multiple times. Judge also includes zero output rows (empty weights) to verify shape contract. Tolerance is relative 8e-5 accounting for both RMS reduction and projection accumulation."
+      }
+    ]
+  }
+}

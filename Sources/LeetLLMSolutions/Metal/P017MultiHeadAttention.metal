@@ -1,0 +1,8 @@
+#include <metal_stdlib>
+using namespace metal;
+kernel void multi_head_attention(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device float *o [[buffer(3)]], constant uint4 &shape [[buffer(4)]], constant uint4 &dims [[buffer(5)]], uint index [[thread_position_in_grid]]) {
+    if (index >= shape.x * shape.z) return; uint query = index / shape.z; uint head = index % shape.z; uint queryPosition = dims.z + query; float maximum = -INFINITY;
+    for (uint key = 0; key < shape.y; ++key) { if (dims.w + key > queryPosition) continue; float score = 0.0f; for (uint d = 0; d < dims.x; ++d) score += q[(query * shape.z + head) * dims.x + d] * k[(key * shape.w + head) * dims.x + d]; maximum = max(maximum, score * rsqrt(float(dims.x))); }
+    float denominator = 0.0f; for (uint key = 0; key < shape.y; ++key) { if (dims.w + key > queryPosition) continue; float score = 0.0f; for (uint d = 0; d < dims.x; ++d) score += q[(query * shape.z + head) * dims.x + d] * k[(key * shape.w + head) * dims.x + d]; denominator += exp(score * rsqrt(float(dims.x)) - maximum); }
+    for (uint d = 0; d < dims.x; ++d) { float sum = 0.0f; for (uint key = 0; key < shape.y; ++key) { if (dims.w + key > queryPosition) continue; float score = 0.0f; for (uint f = 0; f < dims.x; ++f) score += q[(query * shape.z + head) * dims.x + f] * k[(key * shape.w + head) * dims.x + f]; sum += exp(score * rsqrt(float(dims.x)) - maximum) / denominator * v[(key * shape.w + head) * dims.x + d]; } o[(query * shape.z + head) * dims.x + d] = sum; }
+}

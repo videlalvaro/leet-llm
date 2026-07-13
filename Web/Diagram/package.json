@@ -1,0 +1,17 @@
+{
+  "name": "leetllm-diagram",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node validate.mjs"
+  },
+  "dependencies": {
+    "mermaid": "11.16.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1",
+    "jsdom": "26.1.0"
+  }
+}

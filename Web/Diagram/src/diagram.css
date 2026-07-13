@@ -1,0 +1,64 @@
+:root {
+  color-scheme: light dark;
+  font-family: "Avenir Next", Avenir, sans-serif;
+  background: transparent;
+}
+
+html,
+body,
+#diagram {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+#diagram {
+  box-sizing: border-box;
+  min-height: 140px;
+  overflow: auto;
+  padding: 12px 8px;
+  scrollbar-gutter: stable;
+}
+
+#diagram.can-pan {
+  cursor: grab;
+}
+
+#diagram.is-panning {
+  cursor: grabbing;
+  user-select: none;
+}
+
+.diagram-canvas {
+  box-sizing: border-box;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.diagram-canvas svg {
+  display: block;
+  width: 100%;
+  max-width: 100% !important;
+  height: auto !important;
+}
+
+#diagram .diagram-error {
+  box-sizing: border-box;
+  width: 100%;
+  margin: 0;
+  padding: 14px;
+  border-left: 3px solid #b5433d;
+  color: #762e2a;
+  background: #fff1ef;
+  font: 12px/1.5 "SFMono-Regular", Menlo, monospace;
+  white-space: pre-wrap;
+}
+
+@media (prefers-color-scheme: dark) {
+  #diagram .diagram-error {
+    color: #ffb4ad;
+    background: #321c1b;
+  }
+}

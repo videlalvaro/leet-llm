@@ -1,0 +1,186 @@
+{
+  "035": {
+    "strategy": "Assemble one complete pre-norm decoder block that sequences attention and MLP as independent branches off a shared residual stream. Normalize the input residual before Q/K/V projection, apply RoPE at explicit absolute position offsets after projection, compute causal grouped-query attention by mapping query heads to KV heads via integer division, concatenate attention heads back to model dimension, add the attention output to the original residual (first residual boundary), normalize post-attention residual before gate and up projections, apply SiLU activation to the gate and element-wise multiply with the up projection output, project down, and add to post-attention residual (second residual boundary). Capture intermediates at every semantic boundary to localize convention errors.",
+    "invariant": "Both residual addition points (post-attention and post-MLP) must accumulate exactly once. RMSNorm must be applied before every projection using direct-gamma convention: output[i] = input[i] * (gamma[i] / sqrt(mean(input^2) + epsilon)). RoPE must be applied to projected Q and K after reshaping to heads but before attention, not before projection. SwiGLU output is element-wise product of SiLU(gate) and up, never SiLU(gate + up) or other formulations.",
+    "pitfall": "Applying RoPE before reshaping to head dimensions or after cache appending produces plausible finite logits but implements a different model. Normalizing the wrong residual input (e.g., applying MLP norm to the pre-attention residual instead of post-attention) breaks the pre-norm structure and diverges at layer 0. Failing to map query heads to KV heads during attention causes shape mismatches or silent correctness loss in grouped-query configurations.",
+    "points": [
+      {
+        "title": "RMSNorm direct-gamma formula",
+        "body": "For input vector x and learned scale gamma, compute rms_scale = 1 / sqrt((1/D)*sum(x_i^2) + epsilon), then output[i] = x[i] * rms_scale * gamma[i]. The denominator is summed across the hidden dimension D, not across sequence positions. This is the checkpoint-facing convention used in Llama and similar models."
+      },
+      {
+        "title": "Head shape derivation from projections",
+        "body": "Q projection output [S,D] x [D,D] produces [S,D], reshaped to [S,Hq,dh] where Hq is query head count and dh is head dimension. K/V projections output [S,Hkv*dh], reshaped to [S,Hkv,dh]. The reshaping is a view operation with no data copying; integer division Hq/Hkv must be exact or the configuration is invalid."
+      },
+      {
+        "title": "GQA head mapping via integer division",
+        "body": "For query head h and configuration with Hq query heads and Hkv KV heads, map to KV head floor(h * Hkv / Hq). This is equivalent to floor(h / (Hq/Hkv)). All Hq/Hkv consecutive query heads attend to the same KV head. The groupSize parameter is Hq/Hkv."
+      },
+      {
+        "title": "SwiGLU activation and gating",
+        "body": "Gate and up projections both receive the same normalized residual input. Compute activated_gate = SiLU(gate_projection) = gate / (1 + exp(-gate)) and gated_output = activated_gate element-wise product up_projection. The down projection then processes this gated representation. Never add gate and up before activation."
+      }
+    ]
+  },
+  "036": {
+    "strategy": "Parse a binary weight container with a 20-byte preamble (magic, version, header length), length-delimited UTF-8 JSON header, alignment padding to 8-byte boundary, and aligned payload. Validate the magic bytes (ASCII 'LLMWGT01'), decode little-endian integers for version and header byte count, parse JSON to extract model configuration and tensor descriptors, validate every descriptor's dtype, shape, offset alignment, byte count, and payload bounds, detect overlapping ranges, read Float32 values as little-endian byte sequences converted via bitpattern, and require all named tensors before returning the parsed container.",
+    "invariant": "Every tensor has a unique non-empty name. No two nonempty tensors share bytes in the payload (no overlapping ranges after sorted by start offset). Every Float32 tensor offset is divisible by 4. Byte count equals 4 times the product of shape dimensions. All float values are finite. The model configuration object must supply exactly the 9 required decoder parameters (modelDimension, hiddenDimension, queryHeadCount, keyValueHeadCount, headDimension, rotaryDimension, rmsNormEpsilon, ropeBase, and implicit model fingerprint computation).",
+    "pitfall": "Trusting external metadata (length, offset) without validation can cause out-of-bounds reads, integer overflow on shape products, or silent tensor aliasing if overlaps are not detected. Reading Float32 bytes using native pointer casting makes alignment and host byte-order implicit; bitpattern conversion is required for reproducibility. Failing to validate that descriptor byte counts match shape sizes allows misaligned or truncated tensors to pass silently.",
+    "points": [
+      {
+        "title": "Preamble and header layout",
+        "body": "Bytes 0-7: magic string 'LLMWGT01' in ASCII. Bytes 8-11: version as UInt32 little-endian (currently 1). Bytes 12-19: header byte count as UInt64 little-endian. Bytes 20 to 20+count: UTF-8 JSON header (no embedded nulls). Bytes 20+count to next multiple of 8: zero padding. Payload offsets are relative to payload start, not file start."
+      },
+      {
+        "title": "Float32 bitpattern reading without unsafe casting",
+        "body": "Read 4 bytes at offset i: bits = bytes[i] | (bytes[i+1]<<8) | (bytes[i+2]<<16) | (bytes[i+3]<<24). Convert UInt32 to Float via Float(bitPattern: bits). This preserves exact IEEE 754 values (including subnormals and negative zero) and works identically across host byte orders after decoding little-endian bytes."
+      },
+      {
+        "title": "Overlap detection algorithm",
+        "body": "Filter nonempty ranges (start < end), sort by (start ascending, end ascending), then iterate: for each range[i], check that range[i].start >= range[i-1].end. If sorted start < prior end, ranges overlap. This O(n log n) approach catches all pairs without O(n^2) comparisons."
+      },
+      {
+        "title": "Shape-to-byte-count validation",
+        "body": "Compute elementCount by multiplying shape dimensions with overflow check. expectedByteCount = elementCount * 4 (for Float32). If descriptor.byteCount != expectedByteCount, reject the descriptor. A shape containing 0 is valid (zero elements, zero bytes)."
+      }
+    ]
+  },
+  "037": {
+    "strategy": "Implement byte-level byte-pair encoding by starting with UTF-8 bytes of text mapped to single-byte token IDs (0-255), then iteratively finding and applying the best-ranked merge pair. At each step, inspect all adjacent token pairs, select the pair with the lowest merge rank (and lowest sequence index for ties), replace the two IDs with the rule's result ID, and repeat until no pair has a merge rule. After merging completes, optionally prepend BOS or append EOS token IDs based on encoding policy flags. Decode by reversing the process: concatenate token bytes losslessly, or validate UTF-8 for text decode.",
+    "invariant": "Every merge rule has result bytes equal to the concatenation of left-token bytes and right-token bytes. The encoded sequence length never exceeds the prompt text byte length (merges only reduce length). Base vocabulary IDs 0-255 map to single bytes. BOS/EOS tokens are added only when explicitly requested via encoding options, never inferred from text content. Detokenization is lossless: encoding then decoding always recovers the original bytes.",
+    "pitfall": "Applying merges out of rank order or using highest-ranked pair instead of lowest-ranked produces a different tokenization and breaks checkpoint compatibility. Merging a non-minimum-rank pair even once causes subsequent merges to operate on a different sequence. Adding BOS/EOS unconditionally instead of checking encoding options causes token count mismatches with reference tokenizers.",
+    "points": [
+      {
+        "title": "Base byte vocabulary and merge result IDs",
+        "body": "Token IDs 0-255 own exactly one byte each: token_bytes[0] = [0x00], token_bytes[1] = [0x01], ..., token_bytes[255] = [0xFF]. Merge rules create higher IDs (starting above 256) whose bytes equal the concatenation of their two source tokens. A merge pair (left_id=116, right_id=104) with result=258 means bytes[258] = bytes[116] || bytes[104] = [0x74] || [0x68] = [0x74, 0x68]."
+      },
+      {
+        "title": "Leftmost tie-breaking in merge selection",
+        "body": "If the same best-ranked pair appears at multiple sequence indices, always merge the occurrence at the lowest index first. For example, if (101, 102) has rank 5 and appears at indices [3, 7], merge index 3, then re-scan for the next best pair. This ensures deterministic output independent of pair duplication."
+      },
+      {
+        "title": "Merge invariant preservation",
+        "body": "Before merging pair (left, right) to result, verify that bytes[result] == bytes[left] || bytes[right] where || is byte concatenation. The tokenizer initializer checks this invariant. After any merge operation, the byte sequence represented by the token list never changes; only the segmentation (number of tokens) changes."
+      },
+      {
+        "title": "BOS/EOS policy vs. content inference",
+        "body": "The encoding API accepts BPEEncodingOptions with addBeginningOfSequence and addEndOfSequence flags. Only insert tokenizer.beginningOfSequenceTokenID at index 0 if addBeginningOfSequence is true, and append tokenizer.endOfSequenceTokenID if addEndOfSequence is true. Never infer these tokens from text; they are explicit policy, not automatic."
+      }
+    ]
+  },
+  "038": {
+    "strategy": "Sort logits in descending order (breaking ties by token ID ascending), optionally retain only the top-k highest logits, compute stable softmax over retained logits by subtracting the maximum to avoid overflow, optionally apply nucleus (top-p) filtering by accumulating probabilities until the cumulative sum reaches or exceeds p (including the boundary-crossing token), renormalize the retained probabilities by their sum, then either return the argmax as the greedy selection or draw a sample from the renormalized distribution using a seeded PRNG. Compose these operations in fixed order: rank, top-k, softmax, top-p, draw.",
+    "invariant": "Stable softmax max-subtraction (subtracting max(logits/T) before computing exponentials) does not change probability ratios. Renormalization of retained probabilities to sum to 1.0 preserves the ranking of candidates. Temperature > 0 is required for stochastic sampling; temperature = 0 is undefined and must use greedy enum instead. Top-p filtering includes the boundary-crossing token (the one that first makes cumulative probability >= p).",
+    "pitfall": "Applying top-p before softmax or before top-k, or reversing either filter order, defines a mathematically different sampling policy. Temperature = 0 causes division by zero in softmax and must be rejected. Deterministic logit tie-breaking (lower token ID wins) is required; breaking ties inconsistently across runs produces different results. Using non-seeded or incorrectly-advanced PRNG state causes unreproducible multi-token generations.",
+    "points": [
+      {
+        "title": "Stable softmax with temperature scaling",
+        "body": "For finite logits and positive temperature T: scaled = logits[i] / T, max_subtract = max(scaled), exponentials[i] = exp(scaled[i] - max_subtract), probabilities[i] = exponentials[i] / sum(exponentials). The max subtraction prevents overflow and does not change the probability ratios (the max factors out and cancels). Smaller T sharpens the distribution; larger T flattens it."
+      },
+      {
+        "title": "Composition order: rank → top-k → softmax → top-p → draw",
+        "body": "Rank all logits descending (ties broken by token ID ascending). Retain only the top-k entries (if specified). Compute softmax over the retained logits. Apply top-p filtering: accumulate probabilities until reaching p, keeping the boundary-crossing token. Renormalize retained probabilities. Sample or return greedy. Changing this order produces a different policy."
+      },
+      {
+        "title": "Top-p (nucleus) sampling with boundary inclusion",
+        "body": "Sort candidates by descending probability. Initialize cumulative = 0. For each candidate in order: cumulative += probability. If cumulative >= p, include this candidate and stop. The candidate that crosses the boundary (cumulative becomes >= p) must be included, even if it makes cumulative > p. Renormalize the retained candidates."
+      },
+      {
+        "title": "Seeded PRNG state advancement",
+        "body": "Draw a uniform random number from [0, 1) using seeded PRNG and advance the generator state. Accumulate probabilities until cumulative > draw; the first candidate to exceed draw is selected. The generator state must advance deterministically with each call, enabling reproducible multi-token sequences from a fixed seed."
+      }
+    ]
+  },
+  "039": {
+    "strategy": "Load a prompt as a sequence of token IDs [t_0, t_1, ..., t_{S-1}]. Gather embeddings by copying rows from the vocabulary table: residual[i] = embedding[t_i]. Execute each decoder block in checkpoint order, passing the residual through RoPE at absolute position offsets [positionOffset, positionOffset+1, ..., positionOffset+S-1]. After each block, append the layer's rotated K and unrotated V values at each position to a persistent cache. After all layers, apply final RMSNorm to the residual, select the last row (hidden state at row S-1), project to vocabulary logits via tied or independent output weights. Capture work counts for FLOPs, bytes, and token-dimension products.",
+    "invariant": "Cache appends must be done in checkpoint order (layer 0 before layer 1, etc.) and must preserve all prior K/V records (no overwrites). RoPE positions are absolute, not relative to prompt start. Final hidden unembedding uses only the last sequence row (index S-1), not a reduction over all rows or row 0. All K/V appends at a layer must occur before that layer completes, so decode can read a contiguous cache. Prefill returns the sampled next token from final logits and the complete cache for later decode calls.",
+    "pitfall": "Applying RoPE before caching (rotating K after cache append) or using relative position offsets breaks cache semantics and causes decode position collision. Selecting row 0 or averaging all rows instead of row S-1 produces reference logits that do not match the true next-token probability distribution. Interleaving cache appends from different layers (layer 0 partial, layer 1, back to layer 0) causes cache coherency loss.",
+    "points": [
+      {
+        "title": "Embedding gather and residual initialization",
+        "body": "For each prompt token ID t_i, copy embedding table row t_i to residual row i: residual[i] = embedding[t_i]. This produces a [S,D] matrix where S is prompt length and D is model dimension. The embeddings represent the token's input semantic content and position in the prompt sequence."
+      },
+      {
+        "title": "Absolute logical positions and cache metadata",
+        "body": "Each token at sequence index i receives absolute logical position = positionOffset + i. RoPE is applied at this absolute position. Cache append stores metadata binding each (layer, position) pair to K and V slices. Decode later reads cache by position range [0, current_position] to determine attention visibility."
+      },
+      {
+        "title": "Rotated K vs. unrotated V in cache",
+        "body": "Apply RoPE to Q and K projections before attention, then append the rotated K to cache. Append the unrotated V to cache (rotation is not applied to V). This separation allows decode to apply RoPE at the current position to new K values while reading unrotated V from prior cache entries directly."
+      },
+      {
+        "title": "Final row selection and projection shapes",
+        "body": "Prefill attention is a full [S,S] matrix computation (O(S^2) causal pairs). Projection shapes are all [S,D] inputs (batch dimension). After all layers, final norm is applied to all S rows of the residual. Final hidden is extracted as residual[S-1], a [D] vector. Unembedding projects [D] to [V] logits for the vocabulary."
+      }
+    ]
+  },
+  "040": {
+    "strategy": "Embed a single current token to produce [1,D] residual. Run each decoder block in order, applying RoPE at the supplied logical position before cached attention. Append the current token's rotated K and unrotated V to cache at this position before calling cached attention (so the current token is visible to itself and future tokens). Perform cached attention by reading all cache entries at positions [0, logicalPosition] inclusive. Apply final RMSNorm to the [1,D] residual, extract final hidden (the only row), project to [V] logits, sample the next token, increment the logical position counter, return the sampled token as input to the next decode call.",
+    "invariant": "Cache prefix (all prior K/V records) must remain unchanged. Logical position must be the true absolute position, incremented by 1 on each decode call. Cached attention reads all visible positions [0, currentPosition] inclusive; re-running full-sequence attention instead defeats cache reuse (every prior token would be re-projected). RoPE must be applied before cache append, not after. The sampled token from this call becomes the current token for the next decode call.",
+    "pitfall": "Using full-sequence attention instead of cached single-token attention re-projects all prior tokens, eliminating the memory and compute savings of cached inference. Applying RoPE after cache append or using the previous position instead of current position breaks position semantics. Not incrementing logical position causes new cache appends to collide with prior positions. Advancing the sampler state inconsistently across calls breaks reproducibility of multi-token generation.",
+    "points": [
+      {
+        "title": "Logical position and cache visibility",
+        "body": "Decode assigns one new logical position per call. Cached attention attends over positions [0, currentPosition] inclusive (causal mask over cache depth). Prior cache entries are never re-computed; decode only projects the current token, appends its K/V, and attends over all cached records."
+      },
+      {
+        "title": "Single-token projection and head reshaping",
+        "body": "Current token embedding is [1,D]. Q/K/V projections produce [1,D] outputs. Reshape to [1,Hq,dh] and [1,Hkv,dh]. RoPE is applied at current logicalPosition, rotating both query and key within their [1,Hq,dh] and [1,Hkv,dh] shapes."
+      },
+      {
+        "title": "Cache append ordering: before attention, with rotated K",
+        "body": "Append rotated K and unrotated V to cache before calling cached attention. This ensures the current token's K and V are available during its own attention computation (enabling self-attention if needed by the architecture). Do not project or cache prior tokens again."
+      },
+      {
+        "title": "State advancement and session invariants",
+        "body": "MiniDecoderGenerationSession maintains nextLogicalPosition, cache, generator (PRNG state), and model. Prefill initializes nextLogicalPosition = positionOffset + len(promptTokenIDs). Each decode call increments nextLogicalPosition by 1 and advances generator state deterministically. Stopping conditions are EOS token match or maximum token count reached."
+      }
+    ]
+  },
+  "041": {
+    "strategy": "Define lifetime intervals [firstOperation, lastOperation] (inclusive-inclusive) for each intermediate buffer. Sort buffers by operation boundaries. For each buffer in order, identify all simultaneously-live buffers (those whose lifetimes overlap), extract their physical ranges, find gaps in the live ranges, and place the current buffer at the lowest aligned offset in a gap (first-fit) or in the gap with smallest remainder (best-fit). Compute peak live bytes as the maximum sum of requested sizes live at any single operation. Validate that no two overlapping-lifetime buffers share physical bytes.",
+    "invariant": "Lifetime overlap is inclusive-inclusive: two lifetimes [f_i, l_i] and [f_j, l_j] overlap if f_i <= l_j and f_j <= l_i. Physical overlap is half-open: ranges [o_i, o_i+b_i) and [o_j, o_j+b_j) overlap if o_i < o_j+b_j and o_j < o_i+b_i. A valid plan requires: for every pair of buffers, if their lifetimes do not overlap, their physical ranges may overlap; if their lifetimes overlap, their physical ranges must not overlap. All alignments are power-of-two.",
+    "pitfall": "Confusing lifetime overlap (temporal, at operation l_i) with physical overlap (spatial, byte ranges) leads to aliasing errors. Using exclusive operation endpoints [f, l) instead of inclusive [f, l] misses simultaneous liveness at operation l. Not accounting for alignment padding overstates reuse opportunity and produces invalid plans. Confusing first-fit and best-fit strategies or applying them inconsistently violates determinism.",
+    "points": [
+      {
+        "title": "Lifetime overlap and simultaneous liveness",
+        "body": "Two buffers' lifetimes [f_i, l_i] and [f_j, l_j] overlap (are simultaneously live) if f_i <= l_j AND f_j <= l_i. Inclusive endpoints mean operation l is live for a buffer with lifetime ending at l. Use this predicate to determine which buffers are live during the placement of each new buffer."
+      },
+      {
+        "title": "First-fit allocation: lowest-offset aligned gap",
+        "body": "Scan the list of live ranges in sorted order. Find the first gap (either within the merged live ranges or beyond them) that fits the buffer when aligned. Place the buffer at the aligned offset. If no gap fits, extend the arena."
+      },
+      {
+        "title": "Best-fit allocation: smallest remainder",
+        "body": "Among all gaps (merged live ranges and beyond) that can fit the aligned buffer, select the gap with the least remainder (available space minus buffer size). If multiple gaps have the same remainder, choose the lowest offset. Best-fit often reduces arena size for heterogeneous buffer sizes."
+      },
+      {
+        "title": "Alignment arithmetic and overflow checking",
+        "body": "Next aligned offset from value x with power-of-two alignment a is (x + a - 1) & ~(a - 1). Check for integer overflow when adding alignment padding (a-1) to x. Peak live bytes is computed by iterating all unique operation points and summing the sizes of buffers live at each point."
+      }
+    ]
+  },
+  "042": {
+    "strategy": "Create or load a reference artifact containing model fingerprint, token IDs, position offset, and a deterministically-ordered sequence of capture tensors at semantic boundaries (embeddings, per-layer residual inputs, norms, projections, attention outputs, FFN branches, residuals). Run the candidate implementation and extract the same capture tensors in the same order. Compare shapes (must match exactly) and values (using absolute and relative error tolerances combined). Report the first capture whose shape or values fail tolerance. Provide optional fault injection (RoPE position offset ±1, additive RMSNorm gamma) to localize convention errors.",
+    "invariant": "Artifact capture order is deterministic: embeddings, layer.0.residual_input, layer.0.attention_norm, layer.0.query, ..., layer.L.output, final_norm, logits, selected_token. Candidate must produce all reference captures with matching shapes. Comparison metrics (max absolute error, RMSE, cosine similarity, argmax agreement) are applied in the order they appear in captures. First divergence halts the comparison chain; later divergences may be cascades. Fingerprint and selected token must match exactly.",
+    "pitfall": "Comparing only final logits masks layer-level convention errors (e.g., RoPE shifted by 1 position, additive gamma instead of multiplicative). Using a single loose tolerance instead of combined absolute/relative tolerance misses subtle errors in near-zero regions. Not capturing layer intermediates makes first-divergence attribution impossible (divergence appears only at final logits). Injecting faults globally instead of isolating them to one block prevents root-cause diagnosis.",
+    "points": [
+      {
+        "title": "Artifact format and capture schema",
+        "body": "JSON with formatVersion, provenance (human-readable description), modelFingerprint (deterministic hash of configuration), tokenIDs, positionOffset, captures (array of {name, shape, values}), selectedTokenID. Capture names are unique and nonempty. All float values must be finite. Shape dimensions are nonnegative; product checked against Int.max."
+      },
+      {
+        "title": "Capture order for first-divergence attribution",
+        "body": "Order is: embeddings, then for each layer (residual_input, attention_norm, query, key, value, rope.query, rope.key, attention, attention_output, post_attention, mlp_norm, mlp.gate, mlp.up, mlp.gated, output), then final_norm, logits, selected_token. This order enables layer-by-layer fault localization."
+      },
+      {
+        "title": "Combined absolute and relative error tolerance",
+        "body": "For reference r_i and candidate c_i: max_abs_error = max(|c_i - r_i|), passes if max_abs_error <= abs_tol OR max_abs_error <= rel_tol * |r_i| (per-element). This handles both near-zero values (where relative tolerance is ineffective) and far-from-zero values (where absolute tolerance alone is loose)."
+      },
+      {
+        "title": "Fault injection for convention diagnosis",
+        "body": "ropePositionOffset fault: apply RoPE at position + 1 instead of position (test whether positions are off-by-one). additiveRMSNormGamma fault: use scale = gamma + 1 instead of gamma in norm formula (test whether gamma is multiplicative or additive). Inject one fault per block to isolate its effect."
+      }
+    ]
+  }
+}

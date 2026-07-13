@@ -1,0 +1,117 @@
+{
+  "043": {
+    "strategy": "Fuses RMSNorm and Q/K/V projections into a single operation to eliminate the intermediate normalized tensor and its four transfers. The separate path computes normalization, writes [S,D] to memory, then launches three projection kernels that read it again. The fused path computes normalized values on-the-fly during projection accumulation. The Metal kernel launches one 256-thread threadgroup per token. Each thread accumulates a strided subset of squared features into threadgroup scratch memory, then participates in a tree reduction to compute the row sum of squares. All threads use the shared inverse RMS to scale normalized values while routing combined output channels to the correct Q, K, or V weight base and output buffer.",
+    "invariant": "The fused and separate CPU paths produce identical Float32 outputs (absolute error bounded by 5e-5 + 1e-4*max(|actual|,|expected|)). Each output element equals the inner product of the normalized token row with the corresponding weight row, without materializing or storing the intermediate tensor. The Metal dispatch computes the same values with one RMS reduction and one combined channel loop per token.",
+    "pitfall": "Attempting fusion without careful channel offset routing leads to writing Q outputs into K space or vice versa. The code routes channels [0, Hq*dh) to query, [Hq*dh, Hq*dh+Hkv*dh) to key, and [Hq*dh+Hkv*dh, ...) to value by subtracting the appropriate offset. Mixing up these boundaries silently corrupts attention head assignments.",
+    "points": [
+      {
+        "title": "Intermediate Removal and Traffic Model",
+        "body": "Let normalizedBytes = 4*S*D for the Float32 [S,D] tensor. The separate cost model counts one write by RMSNorm and three reads by the Q/K/V projections, for 4*normalizedBytes = 16*S*D logical bytes, plus normalizedBytes of live intermediate storage. The fused model removes those four transfers and reports zero intermediate bytes. Metal end-to-end timing still includes shared-buffer allocation, host-to-device copy, command submission, and synchronous wait."
+      },
+      {
+        "title": "Threadgroup Reduction Barrier Discipline",
+        "body": "Metal kernel strides features across 256 threads, accumulating partial sums into scratch memory. After initialization, threads participate in a barrier. Tree reduction runs in log(256) steps, with barriers after each stride to ensure all threads see updated values. Threads that do not participate in the final stride steps (e.g., when stride < thread index) must still reach the barrier to avoid deadlock. All threads use scratch[0] as the final sum, then proceed to projection."
+      },
+      {
+        "title": "Combined Channel Indexing and Weight Routing",
+        "body": "The Metal kernel flattens all Q/K/V outputs into one interval [0, Hq*dh + 2*Hkv*dh). For channel c, the code selects: if c < Hq*dh, use queryWeights and queries buffer; else if c < Hq*dh + Hkv*dh, use keyWeights and keys with offset c - Hq*dh; else use valueWeights and values with offset c - Hq*dh - Hkv*dh. This avoids three separate channel loops and keeps projection data access coalesced."
+      },
+      {
+        "title": "CPU Fused Path Recomputes Normalization Per Token",
+        "body": "The fused CPU path does not allocate the normalized intermediate. Instead, for each token, it recomputes the sum of squares and inverse RMS inline within the projection loop. This trades memory allocation for arithmetic recomputation. The CPU path remains readable and demonstrates the mathematical equivalence; the Metal path trades the same recomputation for better parallelism, as threads share one reduction."
+      }
+    ]
+  },
+  "044": {
+    "strategy": "Separates prefill and decode profiling into independent measurement boundaries using a monotonic clock (DispatchTime.uptimeNanoseconds). Prefill runs unreported warmup trials, then times fresh-cache allocations and engine calls to produce time-to-first-token (TTFT). Every warmup or measured decode trial independently repeats the prompt to the target context length, allocates a fresh cache, and prefills it outside the per-token timer; the trial then measures serial decode engine calls. Multiple context lengths reveal how attention work scales. The profiler derives medians and nearest-rank percentiles from sorted samples, converts them to throughput rates, and reports modeled work separately from measured wall-clock time.",
+    "invariant": "Warmup samples are discarded and never included in reported medians. Prefill allocates a fresh cache inside each measured trial. Decode context is prepared outside the timer; only the engine call is timed. Cache is repopulated for each trial and context. Percentiles are computed as the nearest-rank statistic x_(ceil(p*N)), and medians account for even/odd sample count correctly. Modeled work (FLOPs, weight bytes) is derived from the educational model, not inferred from elapsed time.",
+    "pitfall": "Measuring prefill inside decode timing, mixing cache allocation costs into the decode latency, or conflating modeled work with hardware performance counters. Reusing a cache across prefill trials hides allocation overhead in the first trial.",
+    "points": [
+      {
+        "title": "Fresh-Cache Prefill Per Trial",
+        "body": "Each measured prefill trial allocates a new ContiguousKVCache with capacity equal to prompt length. The allocation time is included in the measured wall-clock sample. This simulates TTFT for a cold-start prompt but means that the first trial may be slower due to system allocation overhead. Comparing multiple trials with fresh caches reveals whether a median latency is stable or affected by transient allocation costs."
+      },
+      {
+        "title": "Decode Context Prepared Outside Timer",
+        "body": "Each decode trial creates its own repeated prompt and fresh cache, then runs prefill and selects the initial token before any per-step timer starts. Only each MiniDecoderCPUEngine.decode call is timed. Rebuilding the context for every warmup and measured trial prevents cache state from leaking between trials while keeping cache construction and prefill outside the reported decode samples."
+      },
+      {
+        "title": "Nearest-Rank Percentile Computation",
+        "body": "Sorted samples are indexed using P_p = x_(ceil(p*N) - 1). For nine samples and p=0.75, ceil(0.75*9) = 7, so P_75 is the 7th element (0-indexed at [6]). Medians use the mean of the two middle elements for even counts. This avoids interpolation and remains robust to small sample sizes used in educational profiling."
+      },
+      {
+        "title": "Work Model Labels in Report",
+        "body": "The report records prefill and decode separately, each with a stageName such as 'prefill.ttft' or 'decode.context.16'. It stores backend 'CPU reference (Swift)' and clock 'DispatchTime.uptimeNanoseconds (monotonic)' as separate fields. The timing-boundary text states that prefill includes fresh cache allocation and the engine call, while decode excludes prefill but includes per-step tensor allocations, cache append, sampling, and host execution. Modeled FLOPs and weight bytes remain separate from wall-clock samples."
+      }
+    ]
+  },
+  "045": {
+    "strategy": "A discrete-event simulator with two policies: static batching admits up to `slotCount` requests, runs them to completion (prefill once, then decode iterations until all finish), then admits the next group; continuous batching fills free slots as requests complete while other requests remain active. Both policies emit the same semantic tokens per request (deterministic via P045SemanticExecutor, which takes request ID, prompt, generated tokens, and step). The simulator maintains a timeline of events (idle, prefill, decodeIteration), tracks request state (startTime, finishTime, generatedTokens), and computes makespan, per-request latency, throughput (total tokens / makespan), and slot utilization (occupied slot-time / total available slot-time).",
+    "invariant": "Generated tokens are deterministic per request ID and independent of scheduling order. Throughput under continuous batching is greater than or equal to static (in the fixture, strictly greater). Request latency (finishTime - arrivalTime) may increase for early requests under continuous batching due to prefill pauses for newly admitted requests. Slot utilization is bounded in [0, 1]; total tokens and makespan are consistent across both policies.",
+    "pitfall": "Allowing generated tokens to depend on schedule order (e.g., sampling from the wrong request's prefix or step), continuing decode after a request is complete, or incorrectly computing slot occupancy when requests finish at different times.",
+    "points": [
+      {
+        "title": "Semantic Oracle and Request ID Isolation",
+        "body": "The P045SemanticExecutor.nextToken function takes request ID, prompt, generated tokens so far, and step count, and returns a deterministic token. The oracle recomputes each request's full token sequence by request ID, independent of the timeline, to detect cross-request contamination. If the simulator allows tokens to bleed from one request's distribution to another, the oracle catches it."
+      },
+      {
+        "title": "Static Batching Admits and Runs to Completion",
+        "body": "Static batching issues one prefill event for the admitted group, then alternates decode iteration events until no request in that group has remaining tokens. The loop checks `active.removeAll { remainingDecodeTokens == 0 }` after each iteration. No new requests are admitted until the entire group finishes, so slot waste occurs if one request finishes before others in the same static batch."
+      },
+      {
+        "title": "Continuous Refill and Prefill Pause",
+        "body": "Continuous batching admits new requests into free slots up to `slotCount - active.count`. When new requests are admitted, a prefill event is issued for only the newly admitted set, and the occupancy for that event includes both the newly admitted and previously active requests. This prefill 'pauses' active decode, explaining why early requests may have longer latency than under static batching."
+      },
+      {
+        "title": "Timeline and Utilization Metrics",
+        "body": "Each event records startTime, endTime, occupiedSlotCount, and participants. Occupancy is only counted during prefill and decode events (idle events have zero occupancy). Slot utilization is occupiedSlotUnits (sum of occupancy * duration for all events) divided by slotCount * makespan. The fixture proves that continuous improves throughput while increasing latency for request A, demonstrating the tradeoff explicitly in modeled units without hardware measurements."
+      }
+    ]
+  },
+  "046": {
+    "strategy": "Samples up to K tokens autoregressively from a draft model, then verifies each proposal against target probabilities using an acceptance ratio min(1, p(y)/q(y)). On acceptance, emit the proposal and advance the prefix; on rejection, sample one corrected replacement from normalized max(p(y)-q(y), 0) and stop. If all K proposals pass, emit one bonus token from the target at the full accepted prefix. Traces record every proposal prefix, draft/target probabilities, acceptance decisions, and random draws, enabling deterministic reconstruction. The output distribution equals the target exactly: accepted mass is min(q,p), rejected mass is q*(1-alpha), and corrected mass is max(p-q,0), summing to p.",
+    "invariant": "One-step output distribution equals target distribution. For every vocabulary token y, emitted probability = min(p(y), q(y)) + max(p(y)-q(y), 0) = p(y). Traces must record drafts, targets, acceptance draws, and corrections; sampling the same draft must yield the same proposal (same draw used). Rejection stops the block immediately; bonus is sampled only after all proposals are accepted.",
+    "pitfall": "Sampling from target instead of correction distribution after rejection, continuing verification after rejection, verifying proposal i against the wrong prefix (must use prefix before proposal i, not after), or omitting the bonus token when all proposals pass.",
+    "points": [
+      {
+        "title": "Acceptance Ratio and Correctness Preservation",
+        "body": "For each proposal y sampled from q, the acceptance ratio min(1, p(y)/q(y)) preserves the target distribution. Accepted mass is q(y) * alpha(y) = min(q(y), p(y)). If rejection occurs, the correction distribution is (max(p(y)-q(y), 0)) / sum_z(max(p(z)-q(z), 0)), which restores p(y) after accounting for both accepted and rejected paths. The sum of all emitted masses equals the target marginal for each token."
+      },
+      {
+        "title": "Rejection Correction Sampling",
+        "body": "On rejection of proposal i, the code computes the correction distribution (p-q)+ normalized and samples one replacement token using the rejection distribution. This replacement is emitted, and the block terminates. The replacement must come from the correction distribution, not from the target directly, to maintain the mathematical law. Tracing the rejection distribution is necessary to verify the replacement was correctly sampled."
+      },
+      {
+        "title": "Evolving Proposal Prefix and Per-Proposal Verification",
+        "body": "Draft proposals are built autoregressively: proposal 0 is sampled from prefix; proposal 1 from prefix + [proposal_0]; etc. Target verification occurs at each proposal prefix (before appending that proposal). The target distribution for proposal i is computed at prefix + [proposals_0..._{i-1}], not at the full prefix including proposal i. This ordering is critical: verify proposal i against the prefix state before it was generated."
+      },
+      {
+        "title": "Bonus Token After Accept-All and Cost Break-Even",
+        "body": "If all K proposals pass verification, the code samples one additional 'bonus' token from the target given the prefix [original_prefix] + [all_K_proposals], then emits it. Expected emitted tokens E[N] = 1 + K*a + a^K (accept all K plus bonus with prob a^K). Modeled speedup is targetOnly(E[N]) / (K*draftCost + verifyK), which breaks even when draft cost is low enough to amortize verification. Modeled speedup is never presented as wall-clock acceleration."
+      }
+    ]
+  },
+  "047": {
+    "strategy": "Integrates tokenization, prefill, persistent KV cache, and serial decode with optional Metal verification. Restricted-ASCII tokenizer encodes prompt bytes (a, b, c, space, period) to token IDs 1-6 (BOS=1, EOS=0). Tokenizer and model vocabulary are validated for exact compatibility. Prefill processes all prompt tokens in one batch, populating every layer's cache with S entries. Decode processes one token at a time: the previously selected token is embedded, passed through all layers (appending its KV state to cache when selected), sampled, and checked against EOS. Cache grows by G-1 tokens (each selected token appends KV state only when it becomes the next input). A full-prefix independent oracle (Double accumulation) recomputes all prior tokens to verify cache semantics. Metal verification slice executes layer-0 fused-QKV and RoPE on the real prefill residual, producing five named captures (query, key, value after fused QKV; query, key after RoPE), and compares with CPU using parity tolerance. Report separates CPU generation from Metal verification, labels all boundaries and resource costs, and records one adopted (fusion cost model) and one rejected (labeling verification as a backend) optimization.",
+    "invariant": "Cached generation matches full-prefix independent oracle on every decode step. Cache count at layer L after G generated tokens is promptLength + max(0, G-1). Generated token IDs remain in vocabulary 0..6. Bytes decode from those IDs round-trip through tokenizer. Metal captures pass parity tolerance: abs(metalValue - cpuValue) <= 5e-5 + 1e-4*max(|metal|,|cpu|). Metal is labeling only; it does not own attention, MLP, sampling, or full generation.",
+    "pitfall": "Appending a selected token's KV state to cache before it becomes an input (over-incrementing cache count). Labeling the Metal verification slice as a complete backend. Assuming modeled arena bytes are current process resident memory. Mixing tokenizer vocabulary (0..6) with unsupported input bytes.",
+    "points": [
+      {
+        "title": "Tokenizer-Model Vocabulary Compatibility Check",
+        "body": "Prompt bytes must be in {a, b, c, space, period} (ASCII 97, 98, 99, 32, 46); other bytes throw tokenizerRoundTripMismatch. BOS is token 1, EOS is 0, and content tokens map to 2-6. The tokenizer and model must agree exactly: any mismatch in ID-to-byte mapping fails before model execution. This explicit restriction exposes vocabulary compatibility as a contract requirement, not a silent mismatch."
+      },
+      {
+        "title": "Cache Growth and Selected Token Appending",
+        "body": "Prefill appends S entries (one per prompt token, all sampled in one batch). Decode appends one entry per step, but only when that token is selected and becomes the next input. After G generated tokens, cache size is S + max(0, G-1), not S + G. If maxNewTokens is 0, cache remains at size S. This invariant is verified by computing finalCacheCounts and comparing with S + max(0, |generated|-1) per layer."
+      },
+      {
+        "title": "Full-Prefix Independent Oracle and Parity",
+        "body": "The PromptPrefillResult includes a full-prefix oracle trace at each layer. On every decode step, the capstone compares the cached KV state (read from cache) against a fresh computation of all prior tokens using Double-precision accumulation. If they differ, the cache semantic is broken. Metal parity is checked similarly: captured Metal values against CPU values using combined tolerance, element-wise. Parity passes imply the kernel logic is correct for this input; it does not imply production deployment."
+      },
+      {
+        "title": "Arena Modeled vs. Measured and Metal Resource Labeling",
+        "body": "Prefill and decode arena bytes are modeled first-fit allocations for reusable intermediates (e.g., attention scores, MLP hidden states), derived from P041BufferPlanningSolution.compareDecoderPlans. These are not current process RSS. Metal verification resources include allocatedBufferBytes (shared buffers per dispatch), hostToDeviceBytes, deviceToHostBytes, and dispatch count. The report rejects the optimization 'label verification as backend' because only CPU executes attention, MLP, sampling, and cache management; Metal is a parity slice only."
+      }
+    ]
+  }
+}

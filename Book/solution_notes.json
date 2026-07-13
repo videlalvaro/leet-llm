@@ -1,0 +1,29 @@
+{
+  "001": {
+    "strategy": "Treat the CPU function as the executable definition of the operator, then preserve that contract while changing only the reduction schedule on the GPU. The CPU path validates equal lengths and performs one left-to-right Float32 accumulation. The Metal path assigns one product to each lane, substitutes the additive identity for padded lanes, reduces within each 256-lane threadgroup, and returns one partial sum per group for the host to finish.",
+    "invariant": "Every valid pair contributes exactly one product. Every padded lane contributes exactly zero. At reduction stride s, scratch slots 0 through s-1 contain the sums represented by the two child slots from the preceding level.",
+    "pitfall": "Do not put a threadgroup barrier inside the localIndex < stride branch. Lanes that perform no addition still have to reach every barrier, or the threadgroup does not converge at the synchronization point.",
+    "points": [
+      {
+        "title": "Validate the shape contract first",
+        "body": "The length guard runs before indexing either array. It makes unequal inputs a typed failure and naturally leaves the equal empty-input case with the additive identity, zero."
+      },
+      {
+        "title": "Keep the CPU oracle deliberately plain",
+        "body": "A single indexed loop exposes the exact Float32 accumulation order. That clarity matters when the tree-shaped Metal result differs in low bits but remains within the judge's scale-aware tolerance."
+      },
+      {
+        "title": "Mask work, not participation",
+        "body": "A padded Metal lane stores 0.0 into threadgroup scratch instead of returning early. It therefore contributes no value while still participating in each synchronization point."
+      },
+      {
+        "title": "Reduce by halving the active range",
+        "body": "Each stride adds scratch[localIndex + stride] into the lower half. The following barrier makes the completed level visible before any lane reads it as input to the next level."
+      },
+      {
+        "title": "Separate GPU and host responsibilities",
+        "body": "Only local lane zero writes the threadgroup result. The host pipeline later combines those group partials, avoiding an additional global GPU reduction in this first implementation."
+      }
+    ]
+  }
+}
