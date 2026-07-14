@@ -52,8 +52,12 @@ separate: they run with the permissions of your terminal session.
 
 ## Companion book
 
-The complete course is also generated as a 545-page PDF with native diagrams,
-exercises, and chapter-end solutions. Build and verify it with:
+The complete course is available as a 545-page PDF with native diagrams,
+exercises, and chapter-end solutions:
+
+[Download the LeetLLM Companion PDF](dist/LeetLLM-Companion.pdf)
+
+Rebuild and verify it with:
 
 ```sh
 make -C Book check
@@ -61,8 +65,8 @@ open "dist/LeetLLM-Companion.pdf"
 ```
 
 The book toolchain requires Python 3, Pandoc, LuaLaTeX, latexmk, and
-Ghostscript. Generated book files and the published PDF are intentionally
-excluded from Git.
+Ghostscript. Intermediate book files remain excluded from Git; the published
+PDF is versioned so readers can download it directly from the repository.
 
 ## Project status
 

@@ -15,7 +15,8 @@ make book
 
 The final PDF is copied to the repository's `dist/LeetLLM-Companion.pdf`.
 Generated Markdown, LaTeX, auxiliary files, and the intermediate PDF remain
-under `Book/build/`.
+under `Book/build/`. Commit the published PDF when curriculum or book source
+changes affect its contents.
 
 To rebuild and verify chapter, diagram, exercise, solution, callout, appendix,
 PDF-copy, text-layer, and LaTeX-log completeness:
