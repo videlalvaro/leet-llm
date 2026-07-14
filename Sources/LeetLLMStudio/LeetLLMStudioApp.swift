@@ -418,6 +418,7 @@ struct LessonReader: View {
     let lesson: LessonDocument
     let textSize: Double
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var previewedDocument: PreviewedLocalDocument?
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -510,6 +511,16 @@ struct LessonReader: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle(lesson.title)
+        .environment(\.openURL, OpenURLAction { url in
+            if let document = PreviewedLocalDocument(resolving: url) {
+                previewedDocument = document
+                return .handled
+            }
+            return .systemAction
+        })
+        .sheet(item: $previewedDocument) { document in
+            LocalDocumentPreviewSheet(document: document)
+        }
     }
 
     private func scroll(to section: LessonSection, with proxy: ScrollViewProxy) {
@@ -518,6 +529,112 @@ struct LessonReader: View {
         } else {
             withAnimation(.easeInOut(duration: 0.2)) {
                 proxy.scrollTo(section.anchor, anchor: .top)
+            }
+        }
+    }
+}
+
+struct PreviewedLocalDocument: Identifiable {
+    enum Kind: Equatable {
+        case markdown
+        case source(language: String)
+    }
+
+    let id: String
+    let title: String
+    let contents: String
+    let baseURL: URL
+    let kind: Kind
+
+    init?(resolving url: URL) {
+        let absolute = url.absoluteURL
+        guard absolute.isFileURL,
+              let kind = Self.kind(forExtension: absolute.pathExtension)
+        else {
+            return nil
+        }
+        let fileURL = URL(fileURLWithPath: absolute.path).standardizedFileURL
+        guard let contents = try? String(contentsOf: fileURL, encoding: .utf8) else {
+            return nil
+        }
+        self.id = fileURL.path
+        self.contents = contents
+        self.baseURL = fileURL.deletingLastPathComponent()
+        self.kind = kind
+        switch kind {
+        case .markdown:
+            self.title = Self.firstHeading(in: contents)
+                ?? fileURL.deletingPathExtension().lastPathComponent
+        case .source:
+            self.title = fileURL.lastPathComponent
+        }
+    }
+
+    private static func kind(forExtension pathExtension: String) -> Kind? {
+        switch pathExtension.lowercased() {
+        case "md":
+            .markdown
+        case "swift":
+            .source(language: "swift")
+        case "metal":
+            .source(language: "metal")
+        default:
+            nil
+        }
+    }
+
+    private static func firstHeading(in markdown: String) -> String? {
+        for line in markdown.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("#") else { continue }
+            let heading = trimmed.drop { $0 == "#" }.trimmingCharacters(in: .whitespaces)
+            if !heading.isEmpty { return heading }
+        }
+        return nil
+    }
+}
+
+private struct LocalDocumentPreviewSheet: View {
+    let document: PreviewedLocalDocument
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(StudioTextSize.storageKey) private var textSize = StudioTextSize.defaultValue
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                switch document.kind {
+                case .markdown:
+                    ScrollView {
+                        StructuredText(
+                            markdown: document.contents,
+                            baseURL: document.baseURL,
+                            syntaxExtensions: [.math]
+                        )
+                        .textual.structuredTextStyle(.gitHub)
+                        .textual.fontScale(textSize)
+                        .textual.textSelection(.enabled)
+                        .textual.imageAttachmentLoader(.image(relativeTo: document.baseURL))
+                        .frame(maxWidth: 860, alignment: .leading)
+                        .padding(.horizontal, 32)
+                        .padding(.vertical, 28)
+                        .frame(maxWidth: .infinity, alignment: .top)
+                    }
+                case let .source(language):
+                    CodeEditorView(
+                        text: .constant(document.contents),
+                        documentID: document.id,
+                        language: language,
+                        textScale: textSize,
+                        isEditable: false
+                    )
+                }
+            }
+            .frame(minWidth: 720, minHeight: 560)
+            .navigationTitle(document.title)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
             }
         }
     }

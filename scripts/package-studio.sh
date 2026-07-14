@@ -50,7 +50,10 @@ required_bundles=(
     LeetLLM_LeetLLMStudio.bundle
     LeetLLM_LeetLLMStudio.bundle/Resources/Diagram/index.html
     LeetLLM_LeetLLMStudio.bundle/Resources/Diagram/diagram.js
+    LeetLLM_LeetLLMStudio.bundle/Resources/Diagram/diagram.css
     LeetLLM_LeetLLMStudio.bundle/Resources/Editor/index.html
+    LeetLLM_LeetLLMStudio.bundle/Resources/Editor/editor.js
+    LeetLLM_LeetLLMStudio.bundle/Resources/Editor/editor.css
     swiftui-math_SwiftUIMath.bundle
     textual_Textual.bundle
 )
@@ -75,6 +78,11 @@ for directory_name in $course_source_directories; do
     ditto "Sources/$directory_name" "$course_root/Sources/$directory_name"
 done
 
+mkdir -p "$course_root/docs"
+cp docs/MATH-PRIMER.md "$course_root/docs/MATH-PRIMER.md"
+mkdir -p "$course_root/Tests"
+ditto Tests/LeetLLMCoreTests "$course_root/Tests/LeetLLMCoreTests"
+
 cp Packaging/Studio/Info.plist "$staging_path/Contents/Info.plist"
 cp LICENSE THIRD_PARTY_NOTICES.md "$staging_path/Contents/Resources/Legal/"
 
@@ -88,6 +96,7 @@ required_paths=(
     Contents/Resources/Course/Package.swift
     Contents/Resources/Course/Problems/000-start-here/README.md
     Contents/Resources/Course/Problems/001-vector-dot/README.md
+    Contents/Resources/Course/docs/MATH-PRIMER.md
     Contents/Resources/Legal/LICENSE
     Contents/Resources/Legal/THIRD_PARTY_NOTICES.md
     Contents/Resources/LeetLLM_LeetLLMExercises.bundle
@@ -98,6 +107,36 @@ required_paths=(
 )
 for relative_path in $required_paths; do
     [[ -e "$staging_path/$relative_path" ]]
+done
+
+source_lessons=(Problems/*/README.md(N))
+packaged_lessons=("$course_root"/Problems/*/README.md(N))
+if (( ${#source_lessons} != ${#packaged_lessons} )); then
+    print -u2 "packaged lesson count does not match the source course"
+    exit 1
+fi
+for lesson_path in $source_lessons; do
+    problem_directory=${lesson_path:h:t}
+    while IFS= read -r relative_target; do
+        extension=${relative_target:e}
+        case "${extension:l}" in
+            md|swift|metal) ;;
+            *)
+                print -u2 "unsupported lesson link target: $lesson_path -> $relative_target"
+                exit 1
+                ;;
+        esac
+        packaged_target="$course_root/Problems/$problem_directory/$relative_target"
+        packaged_target=${packaged_target:A}
+        if [[ "$packaged_target" != "$course_root"/* || ! -f "$packaged_target" ]]; then
+            print -u2 "missing packaged lesson link target: $lesson_path -> $relative_target"
+            exit 1
+        fi
+    done < <(
+        grep -Eo '\]\(\.\./\.\./[^)#?]+\)' "$lesson_path" \
+            | sed -E 's/^\]\((.*)\)$/\1/' \
+            || true
+    )
 done
 
 codesign \
