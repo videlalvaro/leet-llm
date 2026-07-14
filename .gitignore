@@ -2,6 +2,7 @@
 Book/build/
 dist/*
 !dist/LeetLLM-Companion.pdf
+!dist/LeetLLM-Companion.epub
 .swiftpm/
 DerivedData/
 xcuserdata/

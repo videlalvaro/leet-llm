@@ -37,8 +37,9 @@ Rebuilding either web bundle changes committed files under
 `Sources/LeetLLMStudio/Resources`. Commit those generated resources together
 with their source changes. Rebuilding dependencies may also change
 `THIRD_PARTY_NOTICES.md`; regenerate and commit it with any lockfile update.
-Rebuilding the book changes `dist/LeetLLM-Companion.pdf`; commit the published
-PDF with curriculum or book-source changes that affect it.
+Rebuilding the book changes `dist/LeetLLM-Companion.pdf` and
+`dist/LeetLLM-Companion.epub`; commit both published artifacts with curriculum
+or book-source changes that affect them.
 
 Keep changes focused, add tests for behavior changes, and update the lessons or
 book when a concept or public command changes. Do not commit generated files
