@@ -611,11 +611,13 @@ actionable setup state.
 
 The packaged app also applies App Sandbox to the Studio, runner, and generated
 learner executable. A security-scoped bookmark carries the user's explicit
-build-folder grant across the runner boundary, and the app has no network
-entitlement. Process separation still matters for crash recovery and
-cancellation. Executing code supplied by an untrusted third-party pack may
-require a stronger resource-isolation boundary, such as a disposable VM or a
-remote runner, and is not silently enabled.
+build-folder grant across the runner boundary. The Studio host has the client
+entitlement required by WebKit, while its content remains bundled and built-in
+checks do not upload learner code. The runner currently inherits the Studio
+sandbox, including that entitlement. Process separation still matters for
+crash recovery and cancellation. Executing code supplied by an untrusted
+third-party pack may require a stronger resource-isolation boundary, such as a
+disposable VM or a remote runner, and is not silently enabled.
 
 ### Swift execution
 
@@ -1214,11 +1216,12 @@ There are three content levels:
    support. Requires a capability review and explicit trust.
 
 No discovered lesson auto-runs code. The packaged app adds App Sandbox, an
-explicit user-selected executable folder, no network entitlement, a separate
-process, timeout, output cap, contained source validation, and an environment
-allowlist. Learner code can still modify the selected folder and consume local
-CPU, memory, or GPU resources. Truly untrusted executable packs may require a
-VM or controlled remote execution service with stronger resource limits.
+explicit user-selected executable folder, a separate process, timeout, output
+cap, contained source validation, and an environment allowlist. The Studio host
+has a WebKit-required client entitlement, and the runner currently inherits it.
+Learner code can still modify the selected folder and consume local CPU, memory,
+GPU, or network resources. Truly untrusted executable packs may require a VM or
+controlled remote execution service with stronger resource limits.
 
 ## Risks and mitigations
 
@@ -1229,7 +1232,7 @@ VM or controlled remote execution service with stronger resource limits.
 | Rich directives make Markdown proprietary | Lessons become unreadable elsewhere | Use valid fenced blocks, graceful fallback, and optional enhancement |
 | Every lesson requests custom UI | Framework becomes 47 hardcoded screens | Versioned generic handlers and family-based conversion |
 | Learner code hangs or crashes | UI instability or data loss | Separate runner, autosave, timeout, cancellation, output and artifact limits |
-| Third-party lessons execute malicious code | Selected-folder damage or resource exhaustion | No auto-run, App Sandbox, no network entitlement, signed built-ins, explicit folder grant, and VM/remote boundary for stronger resource isolation |
+| Third-party lessons execute malicious code | Selected-folder damage, network access, or resource exhaustion | No auto-run, App Sandbox, signed built-ins, explicit folder grant, and VM/remote boundary for stronger resource isolation |
 | Visualizations display invented expectations | Learner trusts a second oracle | Bind to runner traces, authored fixtures, or existing judge/reference captures |
 | Benchmarks become misleading | Learner learns false performance rules | Release-only gate, warmup, repeated samples, units, machine metadata, explicit boundaries |
 | Progress breaks when content changes | Loss of learner history | Explicit IDs, activity IDs, content versions, migration preview, export |

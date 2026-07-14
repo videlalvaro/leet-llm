@@ -22,6 +22,10 @@ function reportSize() {
   });
 }
 
+function afterNextPaint() {
+  return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
 function normalizedZoom(value) {
   const number = Number(value);
   return Number.isFinite(number) ? Math.min(3, Math.max(0.5, number)) : 1;
@@ -128,6 +132,19 @@ window.LeetDiagram = {
       canvasObserver = new ResizeObserver(reportSize);
       canvasObserver.observe(canvas);
       applyZoom(currentZoom);
+      await afterNextPaint();
+      if (sequence !== renderSequence) return;
+      const bounds = image?.getBoundingClientRect();
+      postMessage({
+        type: "rendered",
+        svgCount: root.querySelectorAll("svg").length,
+        graphicsCount: image?.querySelectorAll(
+          "path, rect, circle, ellipse, line, polyline, polygon, text, foreignObject"
+        ).length ?? 0,
+        text: image?.textContent?.trim() ?? "",
+        width: bounds?.width ?? 0,
+        height: bounds?.height ?? 0
+      });
     } catch (error) {
       if (sequence !== renderSequence) return;
       root.replaceChildren();
@@ -174,4 +191,3 @@ function stopPanning(event) {
 
 root.addEventListener("pointerup", stopPanning);
 root.addEventListener("pointercancel", stopPanning);
-postMessage({ type: "ready" });

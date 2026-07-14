@@ -81,8 +81,9 @@ Before the first runnable lesson, the packaged Studio asks you to choose a
 dedicated build folder through the macOS folder picker. It stores editable
 sources, compiler output, and generated learner executables under that folder.
 The Studio, separate runner, and learner executable are signed to use App
-Sandbox, and the packaged app has no network entitlement. Built-in checks do
-not need to send learner code to a remote model or service.
+Sandbox. The Studio host has the client entitlement required by its bundled
+WebKit views, and the runner currently inherits the Studio sandbox. Built-in
+checks do not send learner code to a remote model or service.
 
 The selected folder remains writable to learner code, and a bad implementation
 can consume CPU, memory, or GPU time until cancellation or a timeout takes

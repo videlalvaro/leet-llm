@@ -2,15 +2,26 @@ import Foundation
 import LeetLessonKit
 import SwiftUI
 import Textual
+#if canImport(Darwin)
+import Darwin
+#endif
 
 @main
 struct LeetLLMStudioApp: App {
     @AppStorage(StudioTextSize.storageKey) private var textSize = StudioTextSize.defaultValue
+    private let isRunningDiagramSmokeTest = CommandLine.arguments.contains(
+        "--diagram-smoke-test"
+    )
 
     var body: some Scene {
         WindowGroup("LeetLLM Studio") {
-            StudioRootView(textSize: $textSize)
-                .frame(minWidth: 960, minHeight: 640)
+            if isRunningDiagramSmokeTest {
+                DiagramSmokeTestView()
+                    .frame(width: 900, height: 560)
+            } else {
+                StudioRootView(textSize: $textSize)
+                    .frame(minWidth: 960, minHeight: 640)
+            }
         }
         .defaultSize(width: 1_280, height: 800)
         .commands {
@@ -34,6 +45,115 @@ struct LeetLLMStudioApp: App {
                 .keyboardShortcut("0", modifiers: .command)
                 .disabled(textSize == StudioTextSize.defaultValue)
             }
+        }
+    }
+}
+
+private struct DiagramSmokeTestView: View {
+    private let fixture: DiagramSmokeFixture?
+    private let setupError: String?
+    @State private var didFinish = false
+
+    init() {
+        do {
+            fixture = try DiagramSmokeFixture.load()
+            setupError = nil
+        } catch {
+            fixture = nil
+            setupError = error.localizedDescription
+        }
+    }
+
+    var body: some View {
+        Group {
+            if let fixture {
+                MermaidDiagramView(
+                    id: fixture.id,
+                    source: fixture.source,
+                    title: fixture.title,
+                    verifySnapshot: true,
+                    onRenderEvent: finish
+                )
+            } else {
+                Text(setupError ?? "The packaged diagram fixture is unavailable.")
+            }
+        }
+        .task {
+            if let setupError {
+                finish(.failed(setupError))
+                return
+            }
+            try? await Task.sleep(for: .seconds(20))
+            guard !Task.isCancelled, !didFinish else { return }
+            finish(.failed("The signed diagram smoke test timed out after 20 seconds."))
+        }
+    }
+
+    private func finish(_ event: DiagramRenderEvent) {
+        guard !didFinish else { return }
+        didFinish = true
+
+        switch event {
+        case let .rendered(metrics):
+            let expectedLabels = ["Prompt text", "Tokenizer", "Select the next token"]
+            let missingLabels = expectedLabels.filter { !metrics.text.contains($0) }
+            guard missingLabels.isEmpty, let visiblePixelCount = metrics.visiblePixelCount else {
+                Self.exit(
+                    status: 1,
+                    message: "DIAGRAM_SMOKE_FAIL missing labels: \(missingLabels.joined(separator: ", "))"
+                )
+            }
+            Self.exit(
+                status: 0,
+                message: "DIAGRAM_SMOKE_PASS svg=\(metrics.svgCount) graphics=\(metrics.graphicsCount) width=\(Int(metrics.width)) height=\(Int(metrics.height)) visiblePixels=\(visiblePixelCount)"
+            )
+        case let .failed(message):
+            Self.exit(status: 1, message: "DIAGRAM_SMOKE_FAIL \(message)")
+        }
+    }
+
+    private static func exit(status: Int32, message: String) -> Never {
+        FileHandle.standardOutput.write(Data("\(message)\n".utf8))
+        let resultURL = FileManager.default.temporaryDirectory
+            .appending(path: "leetllm-diagram-smoke-result.txt")
+        try? Data("\(message)\n".utf8).write(to: resultURL, options: .atomic)
+        Darwin.exit(status)
+    }
+}
+
+private struct DiagramSmokeFixture {
+    let id: String
+    let source: String
+    let title: String
+
+    static func load() throws -> Self {
+        guard let courseRoot = Bundle.main.resourceURL?
+            .appending(path: "Course", directoryHint: .isDirectory)
+        else { throw DiagramSmokeError.missingCourse }
+
+        let lesson = try LessonCatalog.discover(in: courseRoot).first { $0.id == "000" }
+        guard let lesson else { throw DiagramSmokeError.missingLesson }
+        guard let diagram = lesson.activities.first(where: {
+            $0.id == "p000-token-generation-loop" && $0.kind == "mermaid"
+        }) else { throw DiagramSmokeError.missingDiagram }
+
+        return Self(id: diagram.id, source: diagram.configuration, title: "\(lesson.title) diagram")
+    }
+}
+
+private enum DiagramSmokeError: Error, LocalizedError {
+    case missingCourse
+    case missingLesson
+    case missingDiagram
+
+    var errorDescription: String? {
+        switch self {
+        case .missingCourse:
+            "The packaged Course resource is missing."
+        case .missingLesson:
+            "The packaged Start Here lesson is missing."
+        case .missingDiagram:
+            "The packaged Start Here token-generation diagram is missing."
         }
     }
 }

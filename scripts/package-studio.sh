@@ -32,7 +32,7 @@ done
 swift build -c "$configuration" --product leetllm-runner
 swift build -c "$configuration" --product leetllm-studio
 
-staging_path="$app_path.staging"
+staging_path="${app_path:r}.staging.app"
 rm -rf "$staging_path"
 mkdir -p "${app_path:h}"
 mkdir -p \
@@ -114,6 +114,7 @@ codesign \
     --timestamp=none \
     "$staging_path"
 codesign --verify --strict --verbose=2 "$staging_path"
+"$repo_root/scripts/smoke-test-studio-diagram.sh" "$staging_path"
 
 rm -rf "$app_path"
 mv "$staging_path" "$app_path"

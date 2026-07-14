@@ -25,6 +25,8 @@ out-of-process checks, persistent completion lists, diagrams, math rendering,
 and text scaling from 80% to 200%. The command line exposes the same lessons,
 learner files, judges, and benchmarks.
 
+![LeetLLM Studio displaying the Start Here lesson and token-generation diagram](docs/assets/leetllm-studio-start-here.png)
+
 From the repository root, package and open the Studio:
 
 ```sh
@@ -43,8 +45,10 @@ final profiling and systems module.
 The packaged Studio is signed with App Sandbox. The first runnable lesson asks
 you to choose a dedicated build folder through the macOS folder picker. Editable
 sources, compiler output, and generated learner executables stay under that
-folder, and the packaged app has no network entitlement. Command-line checks
-are separate: they run with the permissions of your terminal session.
+folder. The Studio host has the client entitlement required by WebKit on
+supported macOS releases; its lesson, diagram, and editor assets are bundled,
+and built-in checks do not upload learner code. Command-line checks are
+separate: they run with the permissions of your terminal session.
 
 ## Companion book
 

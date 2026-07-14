@@ -57,9 +57,11 @@ checklists persist locally.
 
 The packaged Studio, its runner, and generated learner executable are signed to
 use App Sandbox on macOS 15 and later. The Studio requests read, write, and
-executable access only for the build folder you select. Its signature contains
-no client or server network entitlement. Built-in checks do not upload learner
-code to a remote model or service.
+executable access only for the build folder you select. Its host signature also
+contains the client entitlement required by WebKit; lesson, diagram, and editor
+assets remain bundled, and built-in checks do not upload learner code to a
+remote model or service. The packaged runner currently inherits the Studio
+sandbox, including that entitlement.
 
 This boundary does not make arbitrary code harmless. Learner code can read,
 change, or delete files inside the selected build folder and can consume CPU,

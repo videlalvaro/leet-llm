@@ -12,6 +12,11 @@ npm ci --prefix Web/Editor
 npm ci --prefix Web/Diagram
 ```
 
+The diagram test renders every lesson image in a Chromium browser and checks
+the resulting pixels. It detects Microsoft Edge, Google Chrome, or Chromium in
+their standard locations. Set `LEETLLM_BROWSER_PATH` to the browser executable
+when it is installed elsewhere.
+
 ## Before opening a pull request
 
 Run the checks relevant to your change. For a complete validation pass, run:

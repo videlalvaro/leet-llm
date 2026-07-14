@@ -28,7 +28,10 @@ timeline are agreed.
 ## Execution boundary
 
 LeetLLM intentionally compiles and runs learner-authored Swift and Metal code.
-The packaged Studio uses App Sandbox and a user-selected workspace and has no
-network entitlement. Command-line checks are not sandboxed by LeetLLM and run
-with the permissions of the terminal process that launches them. Only run code
-and course content you trust.
+The packaged Studio uses App Sandbox and a user-selected workspace. Its host
+signature includes the client entitlement required to run its bundled WebKit
+diagram and editor views. Built-in checks do not upload learner code, but the
+packaged runner currently inherits the Studio sandbox, including that
+entitlement. Command-line checks are not sandboxed by LeetLLM and run with the
+permissions of the terminal process that launches them. Only run code and
+course content you trust.

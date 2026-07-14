@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title description">
+  <title id="title">LeetLLM social preview</title>
+  <desc id="description">LeetLLM, a hands-on Swift and Metal course for building language-model inference from first principles on Apple silicon.</desc>
+
+  <defs>
+    <pattern id="grid-light" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#FFFFFF" stroke-opacity="0.09" stroke-width="1"/>
+    </pattern>
+    <pattern id="grid-dark" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#0D1821" stroke-opacity="0.065" stroke-width="1"/>
+    </pattern>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#0D1821" flood-opacity="0.2"/>
+    </filter>
+    <clipPath id="panel-clip">
+      <rect x="682" y="64" width="526" height="512" rx="8"/>
+    </clipPath>
+  </defs>
+
+  <rect width="640" height="640" fill="#1646D8"/>
+  <rect x="640" width="640" height="640" fill="#DCE4E8"/>
+  <rect width="640" height="640" fill="url(#grid-light)"/>
+  <rect x="640" width="640" height="640" fill="url(#grid-dark)"/>
+  <path d="M1280 0V214L1132 0Z" fill="#F2385A"/>
+
+  <g font-family="Avenir Next, Helvetica Neue, sans-serif">
+    <g transform="translate(72 64)">
+      <rect width="42" height="42" rx="5" fill="#FFC857"/>
+      <path d="M12 12L23 21L12 30M26 30H33" fill="none" stroke="#0D1821" stroke-width="4" stroke-linecap="square" stroke-linejoin="miter"/>
+      <text x="58" y="17" fill="#FFFFFF" font-family="Menlo, monospace" font-size="14" font-weight="700" letter-spacing="1.6">LEETLLM / 00-47</text>
+      <text x="58" y="38" fill="#C7D6FF" font-family="Menlo, monospace" font-size="13" letter-spacing="0.6">INFERENCE COURSE</text>
+    </g>
+
+    <text x="68" y="247" fill="#FFFFFF" font-size="112" font-weight="800" letter-spacing="0">Leet</text>
+    <text x="68" y="355" fill="#FFFFFF" font-size="112" font-weight="800" letter-spacing="0">LLM</text>
+    <rect x="340" y="321" width="90" height="16" fill="#FFC857"/>
+
+    <text x="72" y="417" fill="#FFFFFF" font-size="27" font-weight="500" letter-spacing="0">Build inference from first principles.</text>
+    <text x="72" y="456" fill="#C7D6FF" font-size="20" font-weight="500" letter-spacing="0">Every operator. CPU oracle. Metal kernel.</text>
+
+    <g transform="translate(72 520)" font-family="Menlo, monospace" font-size="14" font-weight="700" letter-spacing="1.2">
+      <text x="0" y="18" fill="#FFFFFF">SWIFT</text>
+      <rect x="61" y="5" width="5" height="5" fill="#F2385A"/>
+      <text x="82" y="18" fill="#FFFFFF">METAL</text>
+      <rect x="143" y="5" width="5" height="5" fill="#00B8A9"/>
+      <text x="164" y="18" fill="#FFFFFF">APPLE SILICON</text>
+    </g>
+
+    <text x="72" y="588" fill="#B9CBFF" font-family="Menlo, monospace" font-size="13" letter-spacing="0.9">48 GUIDED LESSONS / NATIVE MACOS STUDIO / COMPANION BOOK</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="682" y="64" width="526" height="512" rx="8" fill="#101820"/>
+  </g>
+
+  <g clip-path="url(#panel-clip)">
+    <path d="M1178 64H1208V576H1087Z" fill="#1646D8" fill-opacity="0.28"/>
+    <path d="M682 510L877 576H682Z" fill="#FFC857" fill-opacity="0.12"/>
+  </g>
+
+  <g font-family="Menlo, monospace">
+    <circle cx="714" cy="95" r="5" fill="#F2385A"/>
+    <circle cx="732" cy="95" r="5" fill="#FFC857"/>
+    <circle cx="750" cy="95" r="5" fill="#00B8A9"/>
+    <text x="775" y="101" fill="#A9B8BF" font-size="13" letter-spacing="1.3">FORWARD_PASS.METAL</text>
+    <path d="M702 120H1188" stroke="#31434B"/>
+
+    <text x="706" y="157" fill="#8FA2AA" font-size="12" letter-spacing="1.4">TOKEN IDS</text>
+    <g font-size="15" font-weight="700" text-anchor="middle">
+      <rect x="706" y="173" width="48" height="42" rx="4" fill="#F3F6F7"/>
+      <text x="730" y="200" fill="#0D1821">13</text>
+      <rect x="762" y="173" width="48" height="42" rx="4" fill="#F3F6F7"/>
+      <text x="786" y="200" fill="#0D1821">34</text>
+      <rect x="818" y="173" width="48" height="42" rx="4" fill="#FFC857"/>
+      <text x="842" y="200" fill="#0D1821">08</text>
+      <rect x="874" y="173" width="48" height="42" rx="4" fill="#F3F6F7"/>
+      <text x="898" y="200" fill="#0D1821">21</text>
+    </g>
+    <path d="M938 194H970" stroke="#60747D" stroke-width="2"/>
+    <path d="M962 187L970 194L962 201" fill="none" stroke="#60747D" stroke-width="2"/>
+    <text x="986" y="199" fill="#F3F6F7" font-size="14">[4 x 768]</text>
+
+    <text x="706" y="257" fill="#8FA2AA" font-size="12" letter-spacing="1.4">PROJECT</text>
+    <g font-size="17" font-weight="700" text-anchor="middle">
+      <path d="M730 280L797 331H663Z" transform="translate(42 0)" fill="#F2385A"/>
+      <text x="772" y="318" fill="#0D1821">Q</text>
+      <path d="M861 280L928 331H794Z" transform="translate(0 0)" fill="#00B8A9"/>
+      <text x="861" y="318" fill="#F3F6F7">K</text>
+      <path d="M950 280L1017 331H883Z" fill="#FFC857"/>
+      <text x="950" y="318" fill="#0D1821">V</text>
+    </g>
+    <path d="M772 338C772 373 826 374 845 392M861 338V377M950 338C950 373 896 374 877 392" fill="none" stroke="#6D8088" stroke-width="2"/>
+
+    <rect x="790" y="388" width="148" height="56" rx="6" fill="#F3F6F7"/>
+    <text x="864" y="422" fill="#0D1821" font-size="15" font-weight="700" text-anchor="middle" letter-spacing="1">ATTENTION</text>
+    <path d="M938 416H1008" stroke="#FFC857" stroke-width="3"/>
+    <path d="M998 407L1008 416L998 425" fill="none" stroke="#FFC857" stroke-width="3"/>
+
+    <text x="1028" y="386" fill="#8FA2AA" font-size="11" letter-spacing="1.2">LOGITS</text>
+    <g fill="#00B8A9">
+      <rect x="1028" y="402" width="34" height="7"/>
+      <rect x="1028" y="416" width="88" height="7" fill="#F2385A"/>
+      <rect x="1028" y="430" width="52" height="7" fill="#FFC857"/>
+      <rect x="1028" y="444" width="21" height="7"/>
+    </g>
+
+    <path d="M706 479H1184" stroke="#31434B"/>
+    <text x="706" y="516" fill="#8FA2AA" font-size="12" letter-spacing="1.4">NEXT TOKEN</text>
+    <text x="706" y="548" fill="#F3F6F7" font-size="20" font-weight="700">"swift"</text>
+    <rect x="780" y="530" width="10" height="22" fill="#FFC857"/>
+    <text x="1019" y="548" fill="#8FA2AA" font-size="12">STEP 042 / 047</text>
+  </g>
+
+  <rect x="1232" y="252" width="12" height="136" fill="#1646D8"/>
+  <rect x="1232" y="400" width="12" height="44" fill="#F2385A"/>
+</svg>

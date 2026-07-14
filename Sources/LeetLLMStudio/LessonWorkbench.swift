@@ -12,32 +12,12 @@ struct LessonWorkspaceView: View {
 
     var body: some View {
         if let activity = RuntimeRegistry.activity(forLessonID: lesson.id) {
-            GeometryReader { geometry in
-                if geometry.size.width >= 1_280 {
-                    HSplitView {
-                        LessonReader(lesson: lesson)
-                            .frame(minWidth: 520, idealWidth: 620)
-                        LessonWorkbench(
-                            lesson: lesson,
-                            activity: activity,
-                            textSize: textSize
-                        )
-                            .frame(minWidth: 680, idealWidth: 760)
-                    }
-                } else {
-                    VSplitView {
-                        LessonReader(lesson: lesson)
-                            .frame(minHeight: 320, idealHeight: 470)
-                        LessonWorkbench(
-                            lesson: lesson,
-                            activity: activity,
-                            textSize: textSize
-                        )
-                            .frame(minHeight: 260, idealHeight: 360)
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            LessonActivityWorkspace(
+                lesson: lesson,
+                activity: activity,
+                textSize: textSize
+            )
+            .id(lesson.id)
         } else {
             LessonReader(lesson: lesson)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -45,13 +25,15 @@ struct LessonWorkspaceView: View {
     }
 }
 
-private struct LessonWorkbench: View {
+private struct LessonActivityWorkspace: View {
     @EnvironmentObject private var workspaceAuthorization: WorkspaceAuthorizationController
-    @StateObject private var model: LessonWorkbenchModel
-    @State private var isConfirmingReset = false
+    let lesson: LessonDocument
     let textSize: Double
+    @AppStorage(WorkbenchPanel.storageKey) private var isWorkbenchCollapsed = false
+    @StateObject private var model: LessonWorkbenchModel
 
     init(lesson: LessonDocument, activity: RuntimeActivityDescriptor, textSize: Double) {
+        self.lesson = lesson
         self.textSize = textSize
         _model = StateObject(wrappedValue: LessonWorkbenchModel(
             lesson: lesson,
@@ -60,12 +42,37 @@ private struct LessonWorkbench: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            workbenchToolbar
-            Divider()
-            workbenchContent
+        GeometryReader { geometry in
+            let placement = WorkbenchPanel.placement(forWidth: geometry.size.width)
+            if isWorkbenchCollapsed {
+                collapsedLayout(placement: placement)
+            } else if placement == .trailing {
+                HSplitView {
+                    LessonReader(lesson: lesson)
+                        .frame(minWidth: 520, idealWidth: 620)
+                    LessonWorkbench(
+                        model: model,
+                        textSize: textSize,
+                        placement: placement,
+                        onCollapse: { isWorkbenchCollapsed = true }
+                    )
+                    .frame(minWidth: 680, idealWidth: 760)
+                }
+            } else {
+                VSplitView {
+                    LessonReader(lesson: lesson)
+                        .frame(minHeight: 320, idealHeight: 470)
+                    LessonWorkbench(
+                        model: model,
+                        textSize: textSize,
+                        placement: placement,
+                        onCollapse: { isWorkbenchCollapsed = true }
+                    )
+                    .frame(minHeight: 260, idealHeight: 360)
+                }
+            }
         }
-        .background(.background)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: workspaceAuthorization.authorization?.id) {
             if let authorization = workspaceAuthorization.authorization {
                 await model.prepare(authorization: authorization)
@@ -73,6 +80,109 @@ private struct LessonWorkbench: View {
                 model.revokeWorkspaceAuthorization()
             }
         }
+    }
+
+    @ViewBuilder
+    private func collapsedLayout(placement: WorkbenchPanel.Placement) -> some View {
+        if placement == .trailing {
+            HStack(spacing: 0) {
+                LessonReader(lesson: lesson)
+                Divider()
+                WorkbenchRestoreBar(placement: placement) {
+                    isWorkbenchCollapsed = false
+                }
+            }
+        } else {
+            VStack(spacing: 0) {
+                LessonReader(lesson: lesson)
+                Divider()
+                WorkbenchRestoreBar(placement: placement) {
+                    isWorkbenchCollapsed = false
+                }
+            }
+        }
+    }
+}
+
+enum WorkbenchPanel {
+    static let storageKey = "studio.workbench.isCollapsed"
+    static let trailingLayoutMinimumWidth: CGFloat = 1_280
+
+    enum Placement: Equatable {
+        case trailing
+        case bottom
+
+        var collapseSymbol: String {
+            self == .trailing ? "chevron.right" : "chevron.down"
+        }
+
+        var restoreSymbol: String {
+            self == .trailing ? "chevron.left" : "chevron.up"
+        }
+    }
+
+    static func placement(forWidth width: CGFloat) -> Placement {
+        width >= trailingLayoutMinimumWidth ? .trailing : .bottom
+    }
+}
+
+private struct WorkbenchRestoreBar: View {
+    let placement: WorkbenchPanel.Placement
+    let restore: () -> Void
+
+    var body: some View {
+        Group {
+            if placement == .trailing {
+                VStack {
+                    restoreButton
+                    Spacer()
+                }
+                .padding(.vertical, 8)
+                .frame(width: 42)
+            } else {
+                HStack {
+                    Spacer()
+                    restoreButton
+                    Spacer()
+                }
+                .frame(height: 42)
+            }
+        }
+        .background(.background)
+    }
+
+    private var restoreButton: some View {
+        Button(action: restore) {
+            if placement == .bottom {
+                Label("Show workbench", systemImage: placement.restoreSymbol)
+                    .labelStyle(.titleAndIcon)
+            } else {
+                Label("Show workbench", systemImage: placement.restoreSymbol)
+                    .labelStyle(.iconOnly)
+            }
+        }
+        .buttonStyle(.borderless)
+        .controlSize(.small)
+        .accessibilityLabel("Show workbench")
+        .help("Show the code and build panel")
+    }
+}
+
+private struct LessonWorkbench: View {
+    @EnvironmentObject private var workspaceAuthorization: WorkspaceAuthorizationController
+    @ObservedObject var model: LessonWorkbenchModel
+    @State private var isConfirmingReset = false
+    let textSize: Double
+    let placement: WorkbenchPanel.Placement
+    let onCollapse: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            workbenchToolbar
+            Divider()
+            workbenchContent
+        }
+        .background(.background)
         .confirmationDialog(
             "Reset this file to the course starter?",
             isPresented: $isConfirmingReset
@@ -143,6 +253,15 @@ private struct LessonWorkbench: View {
             }
             .disabled(model.selectedDocument == nil || model.isRunning)
             .help("Reset current file")
+
+            Divider()
+                .frame(height: 16)
+
+            Button(action: onCollapse) {
+                Image(systemName: placement.collapseSymbol)
+            }
+            .accessibilityLabel("Minimize workbench")
+            .help("Minimize the code and build panel")
         }
         .controlSize(.small)
         .padding(.horizontal, 12)

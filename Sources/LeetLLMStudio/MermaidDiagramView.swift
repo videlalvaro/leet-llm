@@ -1,24 +1,73 @@
 import SwiftUI
 import WebKit
 
+enum DiagramRendererResources {
+    static var pageURL: URL? {
+        Bundle.module.url(
+            forResource: "index",
+            withExtension: "html",
+            subdirectory: "Resources/Diagram"
+        )
+    }
+}
+
+struct DiagramRenderMetrics: Equatable, Sendable {
+    let svgCount: Int
+    let graphicsCount: Int
+    let text: String
+    let width: Double
+    let height: Double
+    var visiblePixelCount: Int?
+
+    var isVisible: Bool {
+        svgCount == 1
+            && graphicsCount > 0
+            && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && width > 2
+            && height > 2
+    }
+}
+
+enum DiagramRenderEvent: Equatable, Sendable {
+    case rendered(DiagramRenderMetrics)
+    case failed(String)
+}
+
 struct MermaidDiagramView: View {
     let id: String
     let source: String
     let title: String
+    var verifySnapshot = false
+    var onRenderEvent: (DiagramRenderEvent) -> Void = { _ in }
     @State private var contentHeight: CGFloat = 240
     @State private var zoom = 1.0
     @State private var expandedZoom = 1.0
     @State private var isShowingExpanded = false
+    @State private var renderError: String?
+    @State private var renderAttempt = 0
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            MermaidWebView(
-                id: id,
-                source: source,
-                title: title,
-                zoom: zoom,
-                contentHeight: $contentHeight
-            )
+            ZStack {
+                MermaidWebView(
+                    id: id,
+                    source: source,
+                    title: title,
+                    zoom: zoom,
+                    contentHeight: $contentHeight,
+                    renderError: $renderError,
+                    verifySnapshot: verifySnapshot,
+                    onRenderEvent: onRenderEvent
+                )
+                .id(renderAttempt)
+
+                if let renderError {
+                    DiagramRenderFailureView(message: renderError) {
+                        self.renderError = nil
+                        renderAttempt += 1
+                    }
+                }
+            }
 
             DiagramZoomControls(zoom: $zoom) {
                 expandedZoom = zoom
@@ -42,6 +91,30 @@ struct MermaidDiagramView: View {
                 zoom: $expandedZoom
             )
         }
+    }
+}
+
+private struct DiagramRenderFailureView: View {
+    let message: String
+    let retry: () -> Void
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            Text("Diagram could not render")
+                .font(.headline)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .lineLimit(3)
+            Button("Retry", action: retry)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.background)
     }
 }
 
@@ -115,6 +188,8 @@ private struct ExpandedMermaidDiagramView: View {
     let title: String
     @Binding var zoom: Double
     @State private var contentHeight: CGFloat = 600
+    @State private var renderError: String?
+    @State private var renderAttempt = 0
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -141,13 +216,26 @@ private struct ExpandedMermaidDiagramView: View {
 
             Divider()
 
-            MermaidWebView(
-                id: "\(id)-expanded",
-                source: source,
-                title: title,
-                zoom: zoom,
-                contentHeight: $contentHeight
-            )
+            ZStack {
+                MermaidWebView(
+                    id: "\(id)-expanded",
+                    source: source,
+                    title: title,
+                    zoom: zoom,
+                    contentHeight: $contentHeight,
+                    renderError: $renderError,
+                    verifySnapshot: false,
+                    onRenderEvent: { _ in }
+                )
+                .id(renderAttempt)
+
+                if let renderError {
+                    DiagramRenderFailureView(message: renderError) {
+                        self.renderError = nil
+                        renderAttempt += 1
+                    }
+                }
+            }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(.quaternary.opacity(0.18))
         }
@@ -168,6 +256,9 @@ private struct MermaidWebView: NSViewRepresentable {
     let title: String
     let zoom: Double
     @Binding var contentHeight: CGFloat
+    @Binding var renderError: String?
+    let verifySnapshot: Bool
+    let onRenderEvent: (DiagramRenderEvent) -> Void
     @Environment(\.colorScheme) private var colorScheme
 
     func makeCoordinator() -> Coordinator {
@@ -183,11 +274,7 @@ private struct MermaidWebView: NSViewRepresentable {
         webView.setValue(false, forKey: "drawsBackground")
         context.coordinator.observeScrolling(in: webView)
 
-        guard let resourceURL = Bundle.module.url(
-            forResource: "index",
-            withExtension: "html",
-            subdirectory: "Resources/Diagram"
-        ) else {
+        guard let resourceURL = DiagramRendererResources.pageURL else {
             assertionFailure("The bundled diagram renderer is missing.")
             return webView
         }
@@ -205,6 +292,7 @@ private struct MermaidWebView: NSViewRepresentable {
 
     static func dismantleNSView(_ webView: WKWebView, coordinator: Coordinator) {
         coordinator.stopObservingScrolling()
+        coordinator.cancelRenderTimeout()
         webView.configuration.userContentController.removeScriptMessageHandler(
             forName: "diagram"
         )
@@ -219,6 +307,7 @@ private struct MermaidWebView: NSViewRepresentable {
         private var appliedZoom: Double?
         private weak var webView: WKWebView?
         private var scrollMonitor: Any?
+        private var renderTimeoutTask: Task<Void, Never>?
 
         init(_ parent: MermaidWebView) {
             self.parent = parent
@@ -242,7 +331,29 @@ private struct MermaidWebView: NSViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation?) {
+            isReady = true
             synchronize(webView)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            didFail navigation: WKNavigation?,
+            withError error: Error
+        ) {
+            reportFailure(error.localizedDescription)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            didFailProvisionalNavigation navigation: WKNavigation?,
+            withError error: Error
+        ) {
+            reportFailure(error.localizedDescription)
+        }
+
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            isReady = false
+            reportFailure("The WebKit content process stopped unexpectedly.")
         }
 
         func userContentController(
@@ -254,11 +365,40 @@ private struct MermaidWebView: NSViewRepresentable {
                   let type = body["type"] as? String
             else { return }
 
-            if type == "ready" {
-                isReady = true
-                synchronize(message.webView)
-            } else if type == "size", let height = body["height"] as? NSNumber {
+            if type == "size", let height = body["height"] as? NSNumber {
                 parent.contentHeight = CGFloat(truncating: height)
+            } else if type == "rendered",
+                      let svgCount = body["svgCount"] as? NSNumber,
+                      let graphicsCount = body["graphicsCount"] as? NSNumber,
+                      let text = body["text"] as? String,
+                      let width = body["width"] as? NSNumber,
+                      let height = body["height"] as? NSNumber
+            {
+                let metrics = DiagramRenderMetrics(
+                    svgCount: svgCount.intValue,
+                    graphicsCount: graphicsCount.intValue,
+                    text: text,
+                    width: width.doubleValue,
+                    height: height.doubleValue,
+                    visiblePixelCount: nil
+                )
+                guard metrics.isVisible else {
+                    reportFailure("The renderer returned an empty diagram.")
+                    return
+                }
+                cancelRenderTimeout()
+                parent.renderError = nil
+                if parent.verifySnapshot {
+                    guard let webView else {
+                        reportFailure("The WebKit view was released before verification.")
+                        return
+                    }
+                    verifySnapshot(metrics, in: webView)
+                } else {
+                    parent.onRenderEvent(.rendered(metrics))
+                }
+            } else if type == "error", let error = body["message"] as? String {
+                reportFailure(error)
             }
         }
 
@@ -278,11 +418,90 @@ private struct MermaidWebView: NSViewRepresentable {
             if contentPayload != renderedPayload {
                 renderedPayload = contentPayload
                 appliedZoom = parent.zoom
-                webView.evaluateJavaScript("window.LeetDiagram.render(\(json))")
+                startRenderTimeout()
+                webView.evaluateJavaScript("window.LeetDiagram.render(\(json)); null") {
+                    [weak self] _, error in
+                    if let error {
+                        self?.reportFailure(error.localizedDescription)
+                    }
+                }
             } else if appliedZoom != parent.zoom {
                 appliedZoom = parent.zoom
-                webView.evaluateJavaScript("window.LeetDiagram.setZoom(\(parent.zoom))")
+                webView.evaluateJavaScript("window.LeetDiagram.setZoom(\(parent.zoom)); null") {
+                    [weak self] _, error in
+                    if let error {
+                        self?.reportFailure(error.localizedDescription)
+                    }
+                }
             }
+        }
+
+        func cancelRenderTimeout() {
+            renderTimeoutTask?.cancel()
+            renderTimeoutTask = nil
+        }
+
+        private func startRenderTimeout() {
+            cancelRenderTimeout()
+            renderTimeoutTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(10))
+                guard !Task.isCancelled else { return }
+                self?.reportFailure("The renderer did not finish within 10 seconds.")
+            }
+        }
+
+        private func reportFailure(_ message: String) {
+            cancelRenderTimeout()
+            parent.renderError = message
+            parent.onRenderEvent(.failed(message))
+        }
+
+        private func verifySnapshot(_ metrics: DiagramRenderMetrics, in webView: WKWebView) {
+            webView.takeSnapshot(with: nil) { [weak self] image, error in
+                guard let self else { return }
+                if let error {
+                    reportFailure("The rendered diagram could not be captured: \(error.localizedDescription)")
+                    return
+                }
+                guard let image, let pixelCount = visiblePixelCount(in: image) else {
+                    reportFailure("The rendered diagram snapshot contained no pixels.")
+                    return
+                }
+                guard pixelCount > 500 else {
+                    reportFailure("The rendered diagram snapshot was blank.")
+                    return
+                }
+                var verifiedMetrics = metrics
+                verifiedMetrics.visiblePixelCount = pixelCount
+                parent.onRenderEvent(.rendered(verifiedMetrics))
+            }
+        }
+
+        private func visiblePixelCount(in image: NSImage) -> Int? {
+            guard let representation = image.cgImage(
+                forProposedRect: nil,
+                context: nil,
+                hints: nil
+            ), let providerData = representation.dataProvider?.data,
+                let bytes = CFDataGetBytePtr(providerData),
+                representation.bitsPerPixel >= 24
+            else { return nil }
+
+            let background = (bytes[0], bytes[1], bytes[2])
+            var visiblePixels = 0
+            for row in 0..<representation.height {
+                for column in 0..<representation.width {
+                    let offset = row * representation.bytesPerRow
+                        + column * representation.bitsPerPixel / 8
+                    let difference = max(
+                        abs(Int(bytes[offset]) - Int(background.0)),
+                        abs(Int(bytes[offset + 1]) - Int(background.1)),
+                        abs(Int(bytes[offset + 2]) - Int(background.2))
+                    )
+                    if difference > 12 { visiblePixels += 1 }
+                }
+            }
+            return visiblePixels
         }
 
         private func routeScrollEvent(_ event: NSEvent, over webView: WKWebView) -> NSEvent? {

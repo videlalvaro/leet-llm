@@ -209,7 +209,7 @@ reads the tile down columns, this padding avoids the repeated bank mapping that
 a square power-of-two row length can create.
 
 ```mermaid {#p003-tiled-transpose-copy}
-flowchart LR
+flowchart TD
   Input["Input tile A rows by columns"] -->|"guard row and column"| Load["Contiguous row loads"]
   Load -->|"write tile y x"| Scratch["Threadgroup tile 16 by 17"]
   Scratch -->|"synchronize all lanes"| Barrier["Threadgroup barrier"]

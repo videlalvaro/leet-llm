@@ -12,6 +12,8 @@
   },
   "devDependencies": {
     "esbuild": "0.28.1",
-    "jsdom": "26.1.0"
+    "jsdom": "26.1.0",
+    "playwright-core": "1.61.1",
+    "pngjs": "7.0.0"
   }
 }
