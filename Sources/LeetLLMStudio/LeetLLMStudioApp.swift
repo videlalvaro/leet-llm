@@ -181,22 +181,6 @@ enum StudioTextSize {
         value = max(minimum, rounded(value - step))
     }
 
-    static func dynamicTypeSize(for value: Double) -> DynamicTypeSize {
-        switch value {
-        case ..<0.9: .small
-        case ..<1.0: .medium
-        case ..<1.1: .large
-        case ..<1.2: .xLarge
-        case ..<1.3: .xxLarge
-        case ..<1.4: .xxxLarge
-        case ..<1.5: .accessibility1
-        case ..<1.6: .accessibility2
-        case ..<1.8: .accessibility3
-        case ..<2.0: .accessibility4
-        default: .accessibility5
-        }
-    }
-
     private static func rounded(_ value: Double) -> Double {
         (value * 10).rounded() / 10
     }
@@ -343,7 +327,6 @@ private struct StudioRootView: View {
                 .accessibilityValue("\(Int((textSize * 100).rounded())) percent")
             }
         }
-        .environment(\.dynamicTypeSize, StudioTextSize.dynamicTypeSize(for: textSize))
         .environmentObject(workspaceAuthorization)
     }
 
@@ -433,6 +416,7 @@ private struct StudioRootView: View {
 
 struct LessonReader: View {
     let lesson: LessonDocument
+    let textSize: Double
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -466,6 +450,7 @@ struct LessonReader: View {
                                         syntaxExtensions: [.math]
                                     )
                                     .textual.structuredTextStyle(.gitHub)
+                                    .textual.fontScale(textSize)
                                     .textual.textSelection(.enabled)
                                     .textual.imageAttachmentLoader(
                                         .image(
