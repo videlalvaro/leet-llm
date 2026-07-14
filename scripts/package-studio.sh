@@ -75,6 +75,9 @@ for directory_name in $course_source_directories; do
     ditto "Sources/$directory_name" "$course_root/Sources/$directory_name"
 done
 
+mkdir -p "$course_root/docs"
+cp docs/MATH-PRIMER.md "$course_root/docs/MATH-PRIMER.md"
+
 cp Packaging/Studio/Info.plist "$staging_path/Contents/Info.plist"
 cp LICENSE THIRD_PARTY_NOTICES.md "$staging_path/Contents/Resources/Legal/"
 
@@ -88,6 +91,7 @@ required_paths=(
     Contents/Resources/Course/Package.swift
     Contents/Resources/Course/Problems/000-start-here/README.md
     Contents/Resources/Course/Problems/001-vector-dot/README.md
+    Contents/Resources/Course/docs/MATH-PRIMER.md
     Contents/Resources/Legal/LICENSE
     Contents/Resources/Legal/THIRD_PARTY_NOTICES.md
     Contents/Resources/LeetLLM_LeetLLMExercises.bundle

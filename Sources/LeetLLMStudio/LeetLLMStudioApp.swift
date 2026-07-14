@@ -434,6 +434,7 @@ private struct StudioRootView: View {
 struct LessonReader: View {
     let lesson: LessonDocument
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var previewedDocument: PreviewedMarkdownDocument?
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -525,6 +526,19 @@ struct LessonReader: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle(lesson.title)
+        .environment(\.openURL, OpenURLAction { url in
+            // Lesson prose links to sibling course docs (e.g. the math primer) with
+            // relative paths, which Textual resolves to file URLs. The app is sandboxed,
+            // so handing those to the system is a no-op; render them in-app instead.
+            if let document = PreviewedMarkdownDocument(resolving: url) {
+                previewedDocument = document
+                return .handled
+            }
+            return .systemAction
+        })
+        .sheet(item: $previewedDocument) { document in
+            MarkdownPreviewSheet(document: document)
+        }
     }
 
     private func scroll(to section: LessonSection, with proxy: ScrollViewProxy) {
@@ -533,6 +547,74 @@ struct LessonReader: View {
         } else {
             withAnimation(.easeInOut(duration: 0.2)) {
                 proxy.scrollTo(section.anchor, anchor: .top)
+            }
+        }
+    }
+}
+
+/// A Markdown document referenced from a lesson (such as the math primer) that is
+/// rendered in-app rather than handed to the sandboxed system open handler.
+private struct PreviewedMarkdownDocument: Identifiable {
+    let id: String
+    let title: String
+    let markdown: String
+    let baseURL: URL
+
+    init?(resolving url: URL) {
+        // Textual delivers relative links as a URL with a file base; resolve to the
+        // absolute path (dropping any fragment) before reading from disk.
+        let absolute = url.absoluteURL
+        guard absolute.isFileURL, absolute.pathExtension.lowercased() == "md" else {
+            return nil
+        }
+        let fileURL = URL(fileURLWithPath: absolute.path).standardizedFileURL
+        guard let contents = try? String(contentsOf: fileURL, encoding: .utf8) else {
+            return nil
+        }
+        self.id = fileURL.path
+        self.markdown = contents
+        self.baseURL = fileURL.deletingLastPathComponent()
+        self.title = Self.firstHeading(in: contents)
+            ?? fileURL.deletingPathExtension().lastPathComponent
+    }
+
+    private static func firstHeading(in markdown: String) -> String? {
+        for line in markdown.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("#") else { continue }
+            let heading = trimmed.drop { $0 == "#" }.trimmingCharacters(in: .whitespaces)
+            if !heading.isEmpty { return heading }
+        }
+        return nil
+    }
+}
+
+private struct MarkdownPreviewSheet: View {
+    let document: PreviewedMarkdownDocument
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                StructuredText(
+                    markdown: document.markdown,
+                    baseURL: document.baseURL,
+                    syntaxExtensions: [.math]
+                )
+                .textual.structuredTextStyle(.gitHub)
+                .textual.textSelection(.enabled)
+                .textual.imageAttachmentLoader(.image(relativeTo: document.baseURL))
+                .frame(maxWidth: 860, alignment: .leading)
+                .padding(.horizontal, 32)
+                .padding(.vertical, 28)
+                .frame(maxWidth: .infinity, alignment: .top)
+            }
+            .frame(minWidth: 640, minHeight: 520)
+            .navigationTitle(document.title)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
             }
         }
     }
