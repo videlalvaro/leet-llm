@@ -43,6 +43,14 @@ REQUIRED_PDF_TEXT = (
     "Complete canonical listings",
 )
 MAXIMUM_HORIZONTAL_DIAGRAM_ASPECT_RATIO = 6.0
+CANONICAL_GITHUB_BLOB_ROOT = (
+    "https://github.com/videlalvaro/inference-school/blob/main"
+)
+SUPPORTED_EXTERNAL_LINK_SCHEMES = {"http", "https", "mailto"}
+REPOSITORY_SOURCE_PATH_PREFIXES = (
+    "Sources/InferenceSchool",
+    "Tests/InferenceSchool",
+)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -117,9 +125,41 @@ def archive_target_path(source_path: str, target: str) -> str | None:
         )
     else:
         candidate = source_path
-    if candidate == ".." or candidate.startswith("../") or candidate.startswith("/"):
+    if candidate in {".", ".."} or candidate.startswith("../") or candidate.startswith("/"):
         return None
     return candidate
+
+
+def repository_source_path(target: str) -> str | None:
+    parsed = urlsplit(target)
+    if parsed.netloc.lower() != "github.com":
+        return None
+    components = unquote(parsed.path).strip("/").split("/")
+    if len(components) < 5 or components[2] != "blob":
+        return None
+    path = "/".join(components[4:])
+    if not path.startswith(REPOSITORY_SOURCE_PATH_PREFIXES):
+        return None
+    return path
+
+
+def external_reference_failure(attribute: str, target: str) -> str | None:
+    parsed = urlsplit(target)
+    if attribute == "src":
+        return f"EPUB contains a non-package {attribute}: {target}"
+    valid_web_link = (
+        parsed.scheme in SUPPORTED_EXTERNAL_LINK_SCHEMES - {"mailto"}
+        and bool(parsed.netloc)
+    )
+    valid_mail_link = parsed.scheme == "mailto" and not parsed.netloc
+    if not (valid_web_link or valid_mail_link):
+        return f"EPUB contains an unsupported {attribute}: {target}"
+    source_path = repository_source_path(target)
+    if source_path is not None and not target.startswith(
+        f"{CANONICAL_GITHUB_BLOB_ROOT}/"
+    ):
+        return f"EPUB repository source link is not canonical: {target}"
+    return None
 
 
 def verify_epub(epub_path: Path, failures: list[str]) -> Counter[str]:
@@ -299,12 +339,9 @@ def verify_epub(epub_path: Path, failures: list[str]) -> Counter[str]:
                     if not target:
                         continue
                     parsed_target = urlsplit(target)
-                    if parsed_target.scheme in {"http", "https", "mailto"}:
-                        continue
                     if parsed_target.scheme or parsed_target.netloc:
-                        failures.append(
-                            f"EPUB contains an unsupported {attribute}: {target}"
-                        )
+                        if failure := external_reference_failure(attribute, target):
+                            failures.append(failure)
                         continue
                     target_path = archive_target_path(path, target)
                     if target_path is None:

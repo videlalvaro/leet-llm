@@ -1,8 +1,8 @@
 .build/
 Book/build/
 dist/*
-!dist/LeetLLM-Companion.pdf
-!dist/LeetLLM-Companion.epub
+!dist/Inference-School-Companion.pdf
+!dist/Inference-School-Companion.epub
 .swiftpm/
 DerivedData/
 xcuserdata/

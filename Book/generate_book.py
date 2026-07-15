@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the LeetLLM companion manuscript from curriculum source files."""
+"""Generate the Inference School companion manuscript from curriculum source files."""
 
 from __future__ import annotations
 
@@ -12,17 +12,20 @@ import textwrap
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 BOOK_DIRECTORY = Path(__file__).resolve().parent
 REPOSITORY_ROOT = BOOK_DIRECTORY.parent
 PROBLEMS_DIRECTORY = REPOSITORY_ROOT / "Problems"
-EXERCISES_DIRECTORY = REPOSITORY_ROOT / "Sources" / "LeetLLMExercises"
-SOLUTIONS_DIRECTORY = REPOSITORY_ROOT / "Sources" / "LeetLLMSolutions"
-GITHUB_BLOB_ROOT = "https://github.com/ronaldmannak/leet-llm/blob/main"
+EXERCISES_DIRECTORY = REPOSITORY_ROOT / "Sources" / "InferenceSchoolExercises"
+SOLUTIONS_DIRECTORY = REPOSITORY_ROOT / "Sources" / "InferenceSchoolSolutions"
+GITHUB_BLOB_ROOT = "https://github.com/videlalvaro/inference-school/blob/main"
 
 PDF_FORMAT = "pdf"
 EPUB_FORMAT = "epub"
+SUPPORTED_EXTERNAL_LINK_SCHEMES = {"http", "https", "mailto"}
+EPUB_ASSET_MARKER = ".generated"
+EPUB_ASSET_MARKER_CONTENT = "Inference School EPUB assets\n"
 
 ORIENTATION_CHAPTER_ID = "000"
 COURSE_CHAPTER_IDS = tuple(f"{chapter:03d}" for chapter in range(1, 48))
@@ -255,8 +258,26 @@ def rewrite_epub_links(
     def replacement(match: re.Match[str]) -> str:
         target = match.group("target")
         parsed = urlsplit(target)
-        if parsed.scheme or parsed.netloc or target.startswith("#"):
+        is_image = match.group("prefix").startswith("![")
+        if target.startswith("#"):
             return match.group(0)
+        if parsed.scheme or parsed.netloc:
+            if is_image:
+                raise ValueError(
+                    f"EPUB image in {relative_path(source_path)} must be "
+                    f"repository-local: {target}"
+                )
+            valid_web_link = (
+                parsed.scheme in SUPPORTED_EXTERNAL_LINK_SCHEMES - {"mailto"}
+                and bool(parsed.netloc)
+            )
+            valid_mail_link = parsed.scheme == "mailto" and not parsed.netloc
+            if valid_web_link or valid_mail_link:
+                return match.group(0)
+            raise ValueError(
+                f"EPUB link in {relative_path(source_path)} uses an unsupported "
+                f"scheme: {target}"
+            )
         if parsed.path.startswith("/"):
             raise ValueError(
                 f"EPUB link in {relative_path(source_path)} is root-relative: {target}"
@@ -276,15 +297,19 @@ def rewrite_epub_links(
                 f"EPUB link in {relative_path(source_path)} is missing: {target}"
             )
 
-        anchor = internal_document_anchor(
-            resolved,
-            included_chapter_ids,
-            include_appendices,
-        )
-        if anchor is not None:
-            rewritten = f"#{parsed.fragment or anchor}"
+        if is_image:
+            rewritten = f"../{quote(repository_path.as_posix(), safe='/')}"
         else:
-            rewritten = f"{GITHUB_BLOB_ROOT}/{repository_path.as_posix()}"
+            anchor = internal_document_anchor(
+                resolved,
+                included_chapter_ids,
+                include_appendices,
+            )
+            if anchor is not None:
+                rewritten = f"#{parsed.fragment or anchor}"
+            else:
+                rewritten = f"{GITHUB_BLOB_ROOT}/{repository_path.as_posix()}"
+        if not (not is_image and rewritten.startswith("#")):
             if parsed.query:
                 rewritten += f"?{parsed.query}"
             if parsed.fragment:
@@ -1235,6 +1260,46 @@ def generate(
     return manuscript
 
 
+def prepare_epub_asset_directory(
+    requested_directory: Path,
+    output_path: Path,
+) -> tuple[Path, str]:
+    output_parent = output_path.parent.resolve()
+    asset_directory = requested_directory.resolve()
+    try:
+        relative_asset_directory = asset_directory.relative_to(output_parent)
+    except ValueError as error:
+        raise SystemExit(
+            "EPUB assets must be stored below the manuscript output directory."
+        ) from error
+    if not relative_asset_directory.parts:
+        raise SystemExit(
+            "EPUB assets must use a dedicated child of the manuscript output directory."
+        )
+
+    resolved_output = output_path.resolve()
+    if asset_directory == resolved_output or asset_directory in resolved_output.parents:
+        raise SystemExit("The EPUB manuscript cannot be stored inside its asset directory.")
+
+    marker = asset_directory / EPUB_ASSET_MARKER
+    if asset_directory.exists():
+        recognized = (
+            asset_directory.is_dir()
+            and marker.is_file()
+            and marker.read_text(encoding="utf-8") == EPUB_ASSET_MARKER_CONTENT
+        )
+        if not recognized:
+            raise SystemExit(
+                f"Refusing to replace unrecognized EPUB asset directory: "
+                f"{asset_directory}"
+            )
+        shutil.rmtree(asset_directory)
+
+    asset_directory.mkdir(parents=True)
+    marker.write_text(EPUB_ASSET_MARKER_CONTENT, encoding="utf-8")
+    return asset_directory, relative_asset_directory.as_posix()
+
+
 def main() -> None:
     arguments = parse_arguments()
     asset_directory: Path | None = None
@@ -1242,17 +1307,10 @@ def main() -> None:
     if arguments.format == EPUB_FORMAT:
         if arguments.asset_directory is None:
             raise SystemExit("--asset-directory is required for EPUB output.")
-        asset_directory = arguments.asset_directory
-        try:
-            asset_url_prefix = asset_directory.resolve().relative_to(
-                arguments.output.parent.resolve()
-            ).as_posix()
-        except ValueError as error:
-            raise SystemExit(
-                "EPUB assets must be stored below the manuscript output directory."
-            ) from error
-        if asset_directory.exists():
-            shutil.rmtree(asset_directory)
+        asset_directory, asset_url_prefix = prepare_epub_asset_directory(
+            arguments.asset_directory,
+            arguments.output,
+        )
     chapters = selected_chapters(arguments.chapters)
     notes = load_solution_notes()
     manuscript = generate(
