@@ -47,6 +47,8 @@ if (( ${#checkout_paths} != ${#locked_revisions} )); then
     print -u2 "SwiftPM checkout count does not match Package.resolved"
     exit 1
 fi
+checkout_index_listing=$(mktemp "${TMPDIR:-/tmp}/inference-school-index.XXXXXX")
+trap 'rm -f "$checkout_index_listing"' EXIT
 for checkout_path in $checkout_paths; do
     checkout_identity=${checkout_path:t:l}
     locked_revision=${locked_revisions[$checkout_identity]-}
@@ -60,6 +62,21 @@ for checkout_path in $checkout_paths; do
     fi
     if [[ "$checkout_revision" != "$locked_revision" ]]; then
         print -u2 "SwiftPM checkout revision does not match Package.resolved: $checkout_identity"
+        exit 1
+    fi
+    if ! git -C "$checkout_path" ls-files -v -z > "$checkout_index_listing"; then
+        print -u2 "could not inspect SwiftPM checkout index: $checkout_identity"
+        exit 1
+    fi
+    checkout_index_state=""
+    while IFS= read -r -d '' tracked_entry; do
+        if [[ "$tracked_entry" != "H "* ]]; then
+            checkout_index_state=${tracked_entry[1]}
+            break
+        fi
+    done < "$checkout_index_listing"
+    if [[ -n "$checkout_index_state" ]]; then
+        print -u2 "SwiftPM checkout contains nonstandard Git index state: $checkout_identity"
         exit 1
     fi
     if ! checkout_status=$(
@@ -78,6 +95,8 @@ if (( ${#locked_revisions} != 0 )); then
     print -u2 "Package.resolved contains dependencies without SwiftPM checkouts"
     exit 1
 fi
+rm -f "$checkout_index_listing"
+trap - EXIT
 
 swift build -c "$configuration" --product inference-school-runner
 swift build -c "$configuration" --product inference-school-studio
